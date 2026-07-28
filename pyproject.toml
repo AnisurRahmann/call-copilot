@@ -1,0 +1,38 @@
+[project]
+name = "call-copilot"
+version = "0.1.0"
+description = "Call Copilot — silently record meeting audio in the background, then transcribe locally to clean markdown."
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "audiotap>=0.0.2",
+    "soundfile>=0.12",
+    "faster-whisper>=1.0",
+    "rich>=13.0",
+    "pydantic>=2.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.0",
+]
+
+[project.scripts]
+rec = "rec.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

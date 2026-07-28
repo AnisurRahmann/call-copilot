@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+
+# Project specific
+sessions/*.jsonl
+*.wav
+*.mp3
+*.m4a
+*.webm
+*.ogg
+*.flac
+*.aac
+*.wma
+*.aiff
+*.pcm
+*.opus
+
+# Recordings and audio data
+recordings/
+sessions/
+*.pid
+recorder.log
+*.webm
+*.ogg
+*.flac
+*.aac
+*.wma
+*.aiff
+*.pcm
+*.opus
+
+# Recordings and audio data
+recordings/
+sessions/
+*.pid
+recorder.log

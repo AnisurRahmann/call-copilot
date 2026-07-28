@@ -1,0 +1,195 @@
+# Call Copilot
+
+> One thing. Done really well. Record meetings. Save transcripts. Don't break audio.
+
+Call Copilot is a terminal command (`rec`) that silently records your meeting audio in
+the background, and when you stop it, transcribes the recording locally and saves a
+clean markdown transcript.
+
+```
+$ rec setup         # one-time: verify macOS + grant capture permission
+$ rec start         # starts recording, you keep working
+$ rec stop          # stops, transcribes, saves markdown
+$ rec list          # shows past recordings
+```
+
+## How it captures audio (no BlackHole, no Multi-Output Device)
+
+Call Copilot taps **system audio output directly** via Apple's Core Audio taps API
+(macOS 14.2+), using the [`audiotap`](https://pypi.org/project/audiotap/) library. There
+is:
+
+- **no virtual audio driver** to install (no BlackHole),
+- **no Multi-Output Device** to create in Audio MIDI Setup,
+- **no system output device** to switch and restore,
+- and therefore **no silent-recording failure** that the old driver-based approaches
+  produce when routing breaks.
+
+What you hear through your speakers/headphones is untouched — the tap is a passive read
+of the output stream. The first time you `rec start`, macOS prompts once for permission
+(grant it under **System Settings → Privacy & Security → Screen Recording**, where
+system-audio capture is grouped).
+
+After `rec stop`, the recording is transcribed locally with
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CPU, int8 — no API, no data
+leaves your machine) and written to a markdown transcript.
+
+```
+recording.wav ──> faster-whisper (local, free) ──> transcript.md
+```
+
+## Requirements
+
+- **macOS 14.2 or later** (Core Audio taps API). Apple Silicon recommended.
+- Python 3.11+.
+
+No Homebrew packages, no audio drivers, no manual Audio MIDI Setup. Just `pip install`.
+
+## Install
+
+```bash
+git clone <this repo> && cd call-copilot
+make install          # creates .venv and installs `rec`
+```
+
+## One-time setup
+
+```bash
+rec setup
+```
+
+Verifies your macOS version, that the `audiotap` library + its bundled dylib load, saves
+your config, and tells you about the one-time capture permission prompt.
+
+## Recording a meeting
+
+```bash
+rec start            # shows a live ● REC indicator; Ctrl+C to stop & transcribe
+rec list             # browse past sessions
+rec transcribe 2026-07-27_14-30-00 --model medium    # re-transcribe at higher quality
+rec diagnose 2026-07-27_14-30-00                      # bundle debug info for an AI agent
+```
+
+**`rec start`** shows a live indicator while recording:
+
+```
+● REC  2026-07-28_14-30-00
+elapsed 03:47   size 18.2 MB
+press Ctrl+C to stop & transcribe
+```
+
+Press **Ctrl+C** when your meeting ends — it stops the recording and transcribes in the
+same command, then prints the transcript path. One command, start to finish.
+
+Want the old background behavior instead? `rec start --detach` spawns the recorder and
+exits immediately; stop it later from another terminal with `rec stop` (or check progress
+with `rec status`).
+
+> **Tip:** if a transcript comes back empty, the recording was silent — nothing was
+> playing, or the capture permission was revoked. `rec start` (and `rec stop`) warn you
+> about this immediately, and `rec diagnose <session>` bundles the audio levels + logs.
+
+## Configuration
+
+Stored at `~/.config/rec/config.json` (XDG). Recordings live under
+`~/.local/share/rec/sessions/{id}/`. Override the XDG roots with `XDG_CONFIG_HOME` /
+`XDG_DATA_HOME` if needed.
+
+```json
+{
+  "sample_rate": 16000,
+  "channels": 1,
+  "whisper_model": "base",
+  "capture": "system",
+  "sessions_dir": "~/.local/share/rec/sessions"
+}
+```
+
+16 kHz mono float32 is Whisper's native input format — no resampling, smallest files
+(~7.5 MB/min), best transcription accuracy.
+
+### A note on sample rate (why your recordings play at the right speed)
+
+`audiotap`'s `sample_rate` parameter is **not honored** — the tap always delivers
+audio at your output device's native rate (typically 48 kHz), regardless of what
+we request. `rec` handles this transparently: the recorder **measures the true
+capture rate** when the tap starts and writes the WAV at that rate (so playback
+is the correct speed), and the transcriber **resamples to 16 kHz** before
+feeding Whisper (so transcription is accurate). You don't need to do anything;
+this section exists to explain the `capture_sample_rate` field in `session.json`
+(which may differ from the `sample_rate` in your config).
+
+### A note on VAD (voice activity detection)
+
+Transcription runs **without** faster-whisper's Silero VAD pre-filter by default.
+The VAD is tuned for close-mic speech and aggressively rejects system-audio
+capture (speakers/headphones via a tap, which has a different character) — we've
+seen it discard 100% of a clearly-audible recording and return an empty
+transcript. Whisper's own `no_speech_threshold` handles silence adequately
+without that risk.
+
+If you have clean close-mic input and want long silences skipped (faster,
+cleaner output), enable it per run:
+
+```bash
+rec stop --vad              # VAD on for this transcription
+rec transcribe <id> --vad   # re-transcribe with VAD
+```
+
+## Stack
+
+| Tool | Role |
+|------|------|
+| [`audiotap`](https://github.com/graphaelli/audiotap) | Core Audio taps → captures system audio directly (macOS 14.2+) |
+| [`soundfile`](https://github.com/bastibe/python-soundfile) | Streams WAV chunks to disk (constant memory) |
+| [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) | Local speech-to-text (CPU int8) |
+| [`rich`](https://github.com/Textualize/rich) + [`click`](https://click.palletsprojects.com/) | Terminal UI + CLI |
+
+Everything is free and open-source. Transcription runs 100% locally — no API cost, no
+data leaves the machine. (The first run of a given whisper model downloads its weights
+from Hugging Face; after that it's offline.)
+
+## Logging & debugging
+
+Every activity — the audio tap lifecycle, chunk writes, transcription, formatting, each
+CLI decision — is logged. Logs flow to three destinations:
+
+| Destination | Path | Level | What it's for |
+|---|---|---|---|
+| **Console (stderr)** | your terminal | WARNING* | User-facing; clean by default |
+| **Global log** | `~/.local/share/rec/logs/rec.log` | DEBUG | Monitor surface — `tail -f` it |
+| **Session log** | `~/.local/share/rec/sessions/<id>/recorder.log` | DEBUG | Per-session post-mortem |
+
+\* WARNING by default: `-v` → INFO, `-vv` → DEBUG, `--quiet` → CRITICAL, `REC_LOG_LEVEL=DEBUG`.
+
+Every command failure is logged at `ERROR` with the reason + exit code; unexpected
+crashes include the full traceback.
+
+### Hand a session to an AI agent to debug
+
+```bash
+rec list                                 # find the session id
+rec diagnose 2026-07-27_14-30-00        # → writes sessions/<id>/diagnose.md
+rec diagnose 2026-07-27_14-30-00 --stdout | <your-ai-tool>   # pipe straight to an agent
+```
+
+The bundle contains the session metadata, the daemon's `recorder.log`, the global-log
+lines tagged with that session, the transcript if it exists, and the config — followed
+by a debugging checklist. (`rec diagnose` accepts a unique prefix too, e.g. `2026-07-27`.)
+
+> **Note on the recording loop:** the audio callback runs on Core Audio's real-time
+> thread and deliberately logs nothing — it copies each chunk to a queue and a writer
+> thread does the disk I/O. The daemon logs only at tap start/stop and on signals.
+
+## Development
+
+```bash
+make test            # unit tests (89, offline — no audio device or model download needed)
+```
+
+## What this is NOT
+
+- Not a real-time transcription tool (transcription happens after you stop).
+- Not a meeting summarizer (just the transcript).
+- Not a Zoom/Meet plugin (it captures system audio generically).
+- Not cross-platform (macOS 14.2+ only).
