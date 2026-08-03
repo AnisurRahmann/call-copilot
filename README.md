@@ -15,9 +15,11 @@ $ rec list          # shows past recordings
 
 ## How it captures audio (no BlackHole, no Multi-Output Device)
 
-Call Copilot taps **system audio output directly** via Apple's Core Audio taps API
-(macOS 14.2+), using the [`audiotap`](https://pypi.org/project/audiotap/) library. There
-is:
+By default, `rec` captures **both the microphone (your voice) AND system audio (other
+participants / anything apps play)** — so a real meeting where *you* speak gets recorded,
+not just the audio coming out of your speakers. Both sources are tapped directly via
+Apple's Core Audio taps API (macOS 14.2+) using the [`audiotap`](https://pypi.org/project/audiotap/)
+library. There is:
 
 - **no virtual audio driver** to install (no BlackHole),
 - **no Multi-Output Device** to create in Audio MIDI Setup,
@@ -25,14 +27,28 @@ is:
 - and therefore **no silent-recording failure** that the old driver-based approaches
   produce when routing breaks.
 
-What you hear through your speakers/headphones is untouched — the tap is a passive read
-of the output stream. The first time you `rec start`, macOS prompts once for permission
-(grant it under **System Settings → Privacy & Security → Screen Recording**, where
-system-audio capture is grouped).
+The mic and system streams are recorded as **two separate WAVs** (each at its own true
+rate), transcribed separately, and merged into one transcript with `[Mic]` / `[System]`
+labels so you can tell who said what. Want just one source? `rec start --mic-only` or
+`--system-only`.
 
-After `rec stop`, the recording is transcribed locally with
-[faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CPU, int8 — no API, no data
-leaves your machine) and written to a markdown transcript.
+### Grant capture permission (one-time, per terminal app)
+
+macOS ties capture permission to the app you run `rec` from (Terminal, iTerm, **Warp**,
+VS Code, …). You need **two** grants:
+
+1. **Microphone** (your voice): System Settings → Privacy & Security → **Microphone** →
+   enable your terminal app.
+2. **System audio** (grouped under Screen Recording on macOS 14.2+): System Settings →
+   Privacy & Security → **Screen Recording** → enable your terminal app, then **quit and
+   reopen it** (required for the change to take effect).
+
+Until mic is granted, `rec start` records system audio only and skips the mic (it tells
+you so). `rec setup` checks the current mic-permission status.
+
+After `rec stop` (or Ctrl+C from `rec start`), the recording(s) are transcribed locally
+with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CPU, int8 — no API, no
+data leaves your machine) and written to a markdown transcript.
 
 ```
 recording.wav ──> faster-whisper (local, free) ──> transcript.md
@@ -64,11 +80,16 @@ your config, and tells you about the one-time capture permission prompt.
 ## Recording a meeting
 
 ```bash
-rec start            # shows a live ● REC indicator; Ctrl+C to stop & transcribe
-rec list             # browse past sessions
+rec start                          # mic + system (default); Ctrl+C to stop & transcribe
+rec start --system-only            # just what apps play (not your voice)
+rec start --mic-only               # just your voice (not system audio)
+rec list                           # browse past sessions
 rec transcribe 2026-07-27_14-30-00 --model medium    # re-transcribe at higher quality
 rec diagnose 2026-07-27_14-30-00                      # bundle debug info for an AI agent
 ```
+
+By default `rec start` records **both** your microphone and system audio; the transcript
+labels each line `[Mic]` or `[System]`. Use `--system-only` / `--mic-only` to narrow.
 
 **`rec start`** shows a live indicator while recording:
 

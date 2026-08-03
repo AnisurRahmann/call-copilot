@@ -128,7 +128,7 @@ def test_start_detach_spawns_and_exits(monkeypatch, cfg_written):
     assert "Recording started" in res.output
 
     sid, sr, ch, cap = spawned["args"]
-    assert sr == 16000 and ch == 1 and cap == "system"
+    assert sr == 16000 and ch == 1 and cap == "mic+system"
     meta = session.load_meta(sid)
     assert meta is not None
     assert meta.status == session.STATUS_RECORDING
@@ -224,6 +224,28 @@ def test_stop_transcribes_and_keeps_no_device_state(monkeypatch, cfg_written, fa
     assert meta.word_count == 4  # "Hello world." + "Second segment."
     assert meta.extra.get("audio_silent") is False
     assert session.transcript_path(sid).exists()
+
+
+def test_stop_merges_mic_plus_system_transcript(monkeypatch, cfg_written, fake_transcribe, fake_audio_levels):
+    """When both recording.wav and recording-mic.wav exist, the merged transcript is built."""
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_RECORDING)
+    session.create_session_dir(sid)
+    # Both WAVs present => mic+system was captured.
+    session.wav_path(sid).write_bytes(b"system")
+    session.mic_wav_path(sid).write_bytes(b"mic")
+
+    monkeypatch.setattr(recorder, "active_pid", lambda: 4321)
+    monkeypatch.setattr(recorder, "stop_recorder", lambda: (True, 4321))
+
+    res = CliRunner().invoke(cli.cli, ["stop"])
+    assert res.exit_code == 0, res.output
+    # The merged transcript contains both source labels.
+    text = session.transcript_path(sid).read_text()
+    assert "[System]" in text and "[Mic]" in text
+    assert "**Sources:** System" in text
+    # word_count is the sum across both sources (4 + 4 from the fake).
+    assert session.load_meta(sid).word_count == 8
 
 
 def test_stop_warns_on_silent_recording(monkeypatch, cfg_written, fake_transcribe):

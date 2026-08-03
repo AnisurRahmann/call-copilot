@@ -105,25 +105,33 @@ def spawn_recorder(session_id: str, sample_rate: int, channels: int, capture: st
 
 
 def run_detached(session_id: str, sample_rate: int, channels: int, capture: str) -> int:
-    """Tap system audio -> record to WAV -> block until SIGTERM. Returns exit code."""
+    """Record one or two audio sources to WAV(s) -> block until SIGTERM.
+
+    `capture` selects the source(s):
+      - "system"      -> system audio only (recording.wav)
+      - "mic"         -> microphone only (recording-mic.wav)
+      - "mic+system"  -> BOTH, in parallel, as two separate WAVs
+
+    audiotap ignores the requested sample_rate and delivers at each device's
+    native rate; each source detects + writes at its own true rate. The
+    transcriber resamples each WAV to 16kHz for Whisper, and the formatter
+    merges the two transcripts (labeled [Mic]/[System]) into one markdown.
+    """
     from . import log as log_mod
     from . import session
 
-    # Configure the daemon's logging: DEBUG to the global log + the per-session
-    # recorder.log. No console handler (the daemon has no TTY).
+    # Ensure the session dir + a 'recording' meta exist. The CLI's `start`
+    # command does this too, but run_detached must be self-sufficient (tests and
+    # `python -m rec.recorder` call it directly without the CLI wrapper).
+    session.create_session_dir(session_id)
+    if session.load_meta(session_id) is None:
+        from datetime import datetime
+        session.update_meta(session_id, status=session.STATUS_RECORDING,
+                            started_at=datetime.now().isoformat(timespec="seconds"))
+
     session_log = session.session_dir(session_id) / "recorder.log"
-    log_mod.configure_logging(
-        "daemon",
-        session_id=session_id,
-        session_log_path=session_log,
-    )
+    log_mod.configure_logging("daemon", session_id=session_id, session_log_path=session_log)
     log.info("recorder daemon starting (pid=%d, capture=%s)", os.getpid(), capture)
-
-    import numpy  # used to interpret the float32 PCM bytes
-    import soundfile as sf
-
-    wav = session.wav_path(session_id)
-    wav.parent.mkdir(parents=True, exist_ok=True)
 
     stop_event = threading.Event()
 
@@ -134,137 +142,279 @@ def run_detached(session_id: str, sample_rate: int, channels: int, capture: str)
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    # audiotap's `sample_rate` parameter is NOT honored — the tap always
-    # delivers at the device's native rate (measured ~47kHz on most Macs). We
-    # therefore can't open the WAV until the FIRST callback tells us the real
-    # rate; we defer opening and write the file at whatever rate actually
-    # arrives. This is what makes playback the correct speed (the previous bug
-    # stamped a 47kHz stream as 16kHz, producing 3x-slow "slow-mo" audio and
-    # garbage Whisper output). The transcriber resamples to 16kHz separately.
-    q: queue.Queue = queue.Queue()
-    first_audio = threading.Event()
-    true_rate_holder: list[int] = []  # [samplerate] set by the first callback
-
-    def on_audio(samples_bytes: bytes, frame_count: int, n_channels: int, host_time: int) -> None:
-        # audiotap delivers interleaved 32-bit float PCM. Reinterpret as a
-        # float32 ndarray and copy it so the writer thread owns its own buffer
-        # (the bytes object is transient; the callback runs on a real-time
-        # thread and must not block — we only copy + enqueue here).
-        arr = numpy.frombuffer(samples_bytes, dtype=numpy.float32).copy()
-        if n_channels > 1:
-            arr = arr.reshape(frame_count, n_channels)
-        q.put(arr)
-        if not first_audio.is_set():
-            # frame_count is per-callback frames; we need the rate. Compute it
-            # once from the first chunk's frame_count vs the (known) sample
-            # spacing — but we don't have timing per chunk reliably. Instead we
-            # derive the rate from how many frames arrive per second, measured
-            # across the first ~0.5s of callbacks below. For now, just signal.
-            first_audio.set()
+    recorders: list[_TapRecorder] = []
 
     try:
-        if capture != "system":  # pragma: no cover — only "system" wired today
-            raise click.ClickException(
-                f"capture mode '{capture}' is not supported yet (only 'system')"
+        wanted = _parse_capture(capture)
+        # Build recorders but start them in order: system first so its measured
+        # true rate can serve as the mic's fallback (they share Core Audio's
+        # clock domain, so the rates are almost always identical).
+        sys_recorder = None
+        if "system" in wanted:
+            wav = session.wav_path(session_id)
+            wav.parent.mkdir(parents=True, exist_ok=True)
+            sys_recorder = _TapRecorder("system", wav, sample_rate, channels,
+                                        _create_system_tap, stop_event)
+            recorders.append(sys_recorder)
+        if "mic" in wanted:
+            if not _mic_available():
+                log.warning(
+                    "microphone permission not granted — skipping mic capture. "
+                    "System audio (if any) will still be recorded. Grant mic access "
+                    "in System Settings > Privacy & Security > Microphone."
+                )
+            else:
+                mwav = session.mic_wav_path(session_id)
+                mwav.parent.mkdir(parents=True, exist_ok=True)
+                recorders.append(_TapRecorder("mic", mwav, sample_rate, channels,
+                                              _create_mic_tap, stop_event))
+
+        if not recorders:
+            raise RuntimeError(
+                f"no audio sources available for capture='{capture}' "
+                "(no system tap and mic not permitted)"
             )
 
-        log.info("creating Core Audio system tap (requested rate=%d ch=%d)", sample_rate, channels)
-        tap = _create_system_tap(on_audio, sample_rate, channels)
-        try:
-            tap.start()
-            log.info("tap started — detecting true capture rate...")
+        # Start the system recorder first; its measured true rate becomes the
+        # mic's fallback (far better than the requested 16k when measurement
+        # is unreliable, since both run at the device's native ~48k).
+        if sys_recorder is not None:
+            sys_recorder.start()
+            mic_fallback = sys_recorder.true_rate
+        else:
+            mic_fallback = sample_rate
+        for r in recorders:
+            if r is sys_recorder:
+                continue
+            r.fallback_rate = mic_fallback
+            r.start()
 
-            # Wait briefly for the first audio chunk, then measure the true rate
-            # by counting frames delivered over a short wall-clock window. The
-            # chunks observed during measurement are returned so we can write
-            # them to the WAV too — no audio is lost to rate detection.
-            true_rate, first_chunks = _measure_true_rate(q, sample_rate, wait_seconds=1.0)
-            true_rate_holder.append(true_rate)
-            log.info("detected true capture rate: %d Hz (requested %d)", true_rate, sample_rate)
-            if abs(true_rate - sample_rate) > 500:
-                log.warning(
-                    "audiotap ignored the requested %d Hz and is delivering %d Hz. "
-                    "Recording at the true rate; transcription will resample to 16kHz.",
-                    sample_rate, true_rate,
-                )
-
-            log.info("opening WAV %s (rate=%d ch=%d subtype=FLOAT)", wav, true_rate, channels)
-            with sf.SoundFile(
-                str(wav),
-                mode="x",
-                samplerate=int(true_rate),
-                channels=int(channels),
-                subtype="FLOAT",
-            ) as f:
-                # Write the chunks observed during rate detection first — no
-                # audio is lost to the measurement step.
-                for chunk in first_chunks:
-                    f.write(chunk)
-                log.info("recording started — writing chunks to disk")
-                while not stop_event.is_set():
-                    try:
-                        chunk = q.get(timeout=0.5)
-                    except queue.Empty:
-                        continue
-                    f.write(chunk)  # single writer thread: safe
-                drain_with_timeout(q, f, STOP_TIMEOUT_S)
-                log.info("recording loop ended — draining done")
-        finally:
-            try:
-                tap.stop()
-            finally:
-                tap.destroy()
+        # Block until SIGTERM/SIGINT, then stop them all (drain + close).
+        while not stop_event.is_set():
+            stop_event.wait(timeout=0.5)
+        for r in recorders:
+            r.stop()
     except Exception as e:  # pragma: no cover — device/path errors at runtime
         log.exception("recorder error: %r", e)
+        for r in recorders:
+            try:
+                r.stop()
+            except Exception:
+                pass
         session.update_meta(session_id, status=session.STATUS_RECORDED)
         return 1
 
-    wav_size = wav.stat().st_size if wav.exists() else 0
-    log.info("recording finalized: %s (%d bytes)", wav, wav_size)
-    # Record the true rate so the transcriber resamples to Whisper's 16kHz.
+    # Persist per-source true rates + sizes + status in ONE write (avoids a
+    # load-modify-save race that was wiping extra{}).
     meta = session.load_meta(session_id)
     if meta is not None:
-        meta.extra["capture_sample_rate"] = true_rate_holder[0] if true_rate_holder else sample_rate
+        for r in recorders:
+            tag = "mic" if r.source == "mic" else "system"
+            meta.extra[f"{tag}_sample_rate"] = r.true_rate
+            meta.extra[f"{tag}_bytes"] = r.bytes_written
         meta.extra["requested_sample_rate"] = sample_rate
+        meta.extra["capture"] = capture
+        meta.status = session.STATUS_RECORDED
         session.save_meta(meta)
-    session.update_meta(session_id, status=session.STATUS_RECORDED)
+    else:
+        session.update_meta(session_id, status=session.STATUS_RECORDED)
     log.info("recorder daemon exiting cleanly")
     return 0
+
+
+class _TapRecorder:
+    """One audio source: tap -> rate detection -> WAV writer, until stop_event.
+
+    Encapsulates the single-source logic (formerly run_detached's body) so we
+    can run mic + system in parallel. Each instance owns its queue, callback,
+    tap, and SoundFile; all share the parent `stop_event`.
+    """
+
+    def __init__(self, source, wav_path, sample_rate, channels, tap_factory, stop_event,
+                 fallback_rate=None):
+        import numpy  # ensure numpy is loaded before the callback thread starts
+        assert numpy
+        self.source = source  # "system" | "mic"
+        self.wav_path = wav_path
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.tap_factory = tap_factory
+        self.stop_event = stop_event
+        # Fallback rate if measurement is unreliable. Defaults to the requested
+        # rate, but callers can pass a better guess (e.g. the system tap's
+        # measured rate, since mic+system share Core Audio's clock domain).
+        self.fallback_rate = fallback_rate or sample_rate
+        self.q: queue.Queue = queue.Queue()
+        self.tap = None
+        self.true_rate: int = sample_rate
+        self.bytes_written: int = 0
+
+    def _callback(self, samples_bytes: bytes, frame_count: int, n_channels: int, host_time: int) -> None:
+        # Real-time-thread callback: copy + enqueue only. No I/O, no blocking.
+        import numpy as np
+        arr = np.frombuffer(samples_bytes, dtype=np.float32).copy()
+        if n_channels > 1:
+            arr = arr.reshape(frame_count, n_channels)
+        self.q.put(arr)
+
+    def start(self) -> None:
+        import soundfile as sf
+
+        log.info("creating %s tap (requested rate=%d ch=%d)", self.source, self.sample_rate, self.channels)
+        self.tap = self.tap_factory(self._callback, self.sample_rate, self.channels)
+        self.tap.start()
+        log.info("%s tap started — detecting true capture rate...", self.source)
+
+        # Detect the true rate over a short window; collect the observed chunks
+        # so they're written (no audio lost to measurement).
+        self.true_rate, first_chunks = _measure_true_rate(
+            self.q, self.fallback_rate, wait_seconds=1.0
+        )
+        log.info("%s true capture rate: %d Hz (requested %d)", self.source, self.true_rate, self.sample_rate)
+        if abs(self.true_rate - self.sample_rate) > 500:
+            log.warning(
+                "%s: audiotap ignored requested %d Hz, delivering %d Hz. "
+                "Writing at true rate; transcription resamples to 16kHz.",
+                self.source, self.sample_rate, self.true_rate,
+            )
+
+        log.info("opening %s WAV %s (rate=%d ch=%d subtype=FLOAT)",
+                 self.source, self.wav_path, self.true_rate, self.channels)
+        # Keep the SoundFile open for the recording lifetime; we close in stop().
+        self._sf = sf.SoundFile(
+            str(self.wav_path), mode="x",
+            samplerate=int(self.true_rate), channels=int(self.channels), subtype="FLOAT",
+        )
+        for chunk in first_chunks:
+            self._sf.write(chunk)
+        log.info("%s recording started", self.source)
+
+        # Writer thread drains the queue into the SoundFile until stop_event.
+        self._writer = threading.Thread(target=self._write_loop, name=f"rec-{self.source}-writer", daemon=True)
+        self._writer.start()
+
+    def _write_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                chunk = self.q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._sf.write(chunk)
+            except Exception as e:  # pragma: no cover — defensive
+                log.warning("%s write error: %r", self.source, e)
+                return
+
+    def stop(self) -> None:
+        # Drain remaining queued audio, close the WAV, stop + destroy the tap.
+        try:
+            drain_with_timeout(self.q, self._sf, STOP_TIMEOUT_S)
+        except Exception:  # pragma: no cover
+            pass
+        try:
+            self._sf.close()
+        except Exception:  # pragma: no cover
+            pass
+        self.bytes_written = self.wav_path.stat().st_size if self.wav_path.exists() else 0
+        log.info("%s recording finalized: %s (%d bytes)", self.source, self.wav_path, self.bytes_written)
+        if self.tap is not None:
+            try:
+                self.tap.stop()
+            finally:
+                self.tap.destroy()
+        if getattr(self, "_writer", None) is not None:
+            self._writer.join(timeout=1.0)
+
+
+def _parse_capture(capture: str) -> set[str]:
+    """Normalize a capture mode string into a set of sources."""
+    c = (capture or "system").strip().lower()
+    if c in ("system", "mic"):
+        return {c}
+    if c in ("mic+system", "system+mic", "both", "mic and system"):
+        return {"mic", "system"}
+    raise ValueError(f"unknown capture mode: {capture!r}")
+
+
+def _mic_available() -> bool:
+    """True if mic permission is granted (or promptable). Best-effort."""
+    try:
+        import audiotap
+        status = audiotap.mic_permission_status()
+        if status == audiotap.Permission.GRANTED:
+            return True
+        if status == audiotap.Permission.UNKNOWN:
+            # UNKNOWN means we can still prompt; the actual tap creation will
+            # surface the macOS dialog. Try requesting once.
+            return audiotap.request_mic_permission() == audiotap.Permission.GRANTED
+        return False  # DENIED
+    except Exception:  # pragma: no cover — audiotap missing/broken
+        return False
 
 
 def _measure_true_rate(
     q: queue.Queue, fallback: int, wait_seconds: float = 1.0
 ) -> tuple[int, list]:
-    """Count frames delivered over a wall-clock window to get the real rate.
+    """Measure a tap's true delivery rate and return (rate, all_chunks_seen).
 
     audiotap ignores the requested sample_rate and delivers at the device's
-    native rate. We measure it empirically by draining the queue for
-    `wait_seconds`, summing the frame counts, and dividing by elapsed time.
-    Returns (measured_rate, collected_chunks) — the chunks are handed back so
-    the caller can write them to the WAV and NO audio is lost to measurement.
-    Falls back to `fallback` (with whatever chunks arrived) if no audio comes.
+    native rate. We measure it empirically, but with two guards learned from a
+    real bug (a mic tap measured 11840 Hz during startup burstiness, producing
+    a 4x-slow WAV):
+
+      1. DISCARD a startup-settling window (~0.4s) BEFORE measuring — Core Audio
+         delivers bursty/irregular frames while a tap ramps up, which corrupts
+         a naive measurement. Those frames are still collected and returned so
+         NO audio is lost; they're just excluded from the rate math.
+      2. VALIDATE the result against common audio rates. If the measurement
+         isn't within tolerance of a standard rate (48000/44100/32000/24000/
+         22050/16000), it's almost certainly a bad measurement — fall back to
+         `fallback` rather than baking a nonsense rate into the WAV header.
+
+    `wait_seconds` is the total time spent (settling + measurement).
     """
     import time
 
-    deadline = time.monotonic() + wait_seconds
-    total_frames = 0
+    SETTLE = 0.4  # discard the first 0.4s of bursty startup frames from the math
+    measure_window = max(0.3, wait_seconds - SETTLE)
+
+    settle_deadline = time.monotonic() + SETTLE
     collected: list = []
-    while time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
+    while time.monotonic() < settle_deadline:
+        remaining = settle_deadline - time.monotonic()
         try:
             chunk = q.get(timeout=min(0.2, max(0.05, remaining)))
         except queue.Empty:
             continue
-        total_frames += chunk.shape[0]
+        collected.append(chunk)  # kept for the WAV, but NOT counted for the rate
+
+    measure_deadline = time.monotonic() + measure_window
+    measured_frames = 0
+    start = time.monotonic()
+    while time.monotonic() < measure_deadline:
+        remaining = measure_deadline - time.monotonic()
+        try:
+            chunk = q.get(timeout=min(0.2, max(0.05, remaining)))
+        except queue.Empty:
+            continue
+        measured_frames += chunk.shape[0]
         collected.append(chunk)
-    if not collected:
-        return fallback, []
-    measured = int(round(total_frames / wait_seconds))
-    # Snap to a common audio rate if very close (avoids 47282 vs 48000 jitter).
-    for common in (48000, 44100, 32000, 24000, 22050, 16000):
-        if abs(measured - common) <= 800:
-            return common, collected
-    return measured, collected
+    elapsed = time.monotonic() - start
+
+    if measured_frames == 0 or elapsed <= 0:
+        return fallback, collected
+    measured = int(round(measured_frames / elapsed))
+    # Snap to the nearest common audio rate; if none is close, the measurement
+    # is unreliable (startup burstiness, silent source, etc.) — fall back.
+    common_rates = (48000, 44100, 32000, 24000, 22050, 16000)
+    snapped = min(common_rates, key=lambda c: abs(measured - c))
+    if abs(measured - snapped) <= max(800, snapped * 0.05):  # 5% tolerance
+        return snapped, collected
+    # Measurement didn't match any common rate — don't trust it.
+    import sys
+    print(f"WARN: true-rate measurement {measured} Hz is not near any common "
+          f"audio rate; falling back to {fallback} Hz.", file=sys.stderr, flush=True)
+    return fallback, collected
 
 
 def _create_system_tap(callback, sample_rate: int, channels: int):
@@ -272,6 +422,17 @@ def _create_system_tap(callback, sample_rate: int, channels: int):
     import audiotap
 
     return audiotap.SystemTap(
+        callback=callback,
+        sample_rate=float(sample_rate),
+        channels=int(channels),
+    )
+
+
+def _create_mic_tap(callback, sample_rate: int, channels: int):
+    """Construct a MicTap. Isolated so tests can monkeypatch it."""
+    import audiotap
+
+    return audiotap.MicTap(
         callback=callback,
         sample_rate=float(sample_rate),
         channels=int(channels),

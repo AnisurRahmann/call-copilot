@@ -138,14 +138,30 @@ def setup(default_model: str) -> None:
     # 3. Persist config with the chosen defaults.
     cfg = config.RecConfig(whisper_model=default_model)
     path = config.save_config(cfg)
-    click.echo(f"[ok] Config saved: {path}")
+    click.echo(f"[ok] Config saved: {path} (default capture: {cfg.capture})")
 
-    # 4. Trigger the one-time system-audio capture permission.
+    # 4. Microphone permission check (for the default mic+system capture).
+    click.echo("")
+    try:
+        import audiotap
+        mic_status = audiotap.mic_permission_status().name
+    except Exception:
+        mic_status = "UNKNOWN"
+    if mic_status == "GRANTED":
+        click.echo(f"[ok] Microphone permission: GRANTED")
+    else:
+        click.echo(f"[--] Microphone permission: {mic_status} (needed to record YOUR voice)")
+        click.echo("  Grant it in System Settings > Privacy & Security > Microphone,")
+        click.echo("  for the terminal app you run `rec` from (e.g. Warp). Until granted,")
+        click.echo("  `rec start` records system audio only and skips the mic.")
+
+    # 5. System-audio capture permission.
     click.echo("")
     click.echo("System audio capture permission:")
     click.echo("  macOS will prompt for permission the first time you run `rec start`.")
     click.echo("  Grant it under System Settings > Privacy & Security > Screen Recording")
     click.echo("  (system audio capture is grouped with screen recording).")
+    click.echo("  After toggling it ON for your terminal app, QUIT and reopen the app.")
     click.echo("")
     click.echo("Setup complete. Run `rec start` to begin recording.")
 
@@ -169,13 +185,28 @@ def setup(default_model: str) -> None:
     is_flag=True,
     help="Start in the background and exit immediately (the old behavior). Stop with `rec stop`.",
 )
-def start(model: str | None, vad: bool, detach: bool) -> None:
+@click.option(
+    "--system-only",
+    "system_only",
+    is_flag=True,
+    help="Capture only system audio (what apps play), not the microphone.",
+)
+@click.option(
+    "--mic-only",
+    "mic_only",
+    is_flag=True,
+    help="Capture only the microphone (your voice), not system audio.",
+)
+def start(model: str | None, vad: bool, detach: bool, system_only: bool, mic_only: bool) -> None:
     """Start recording. Shows a live indicator; press Ctrl+C to stop & transcribe."""
+    if system_only and mic_only:
+        raise click.ClickException("--system-only and --mic-only are mutually exclusive.")
     # Guard: already recording?
     if recorder.active_pid() is not None:
         raise click.ClickException("Already recording. Run 'rec stop' first.")
 
     cfg = config.load_config()
+    capture = _resolve_capture(cfg, system_only, mic_only)
 
     session_id = session.new_session_id()
     log_mod.set_session_context(session_id)
@@ -187,7 +218,7 @@ def start(model: str | None, vad: bool, detach: bool) -> None:
     )
 
     try:
-        recorder.spawn_recorder(session_id, cfg.sample_rate, cfg.channels, cfg.capture)
+        recorder.spawn_recorder(session_id, cfg.sample_rate, cfg.channels, capture)
     except Exception as e:
         raise click.ClickException(f"Failed to start recording: {e}") from e
 
@@ -498,35 +529,75 @@ def _transcribe_session(
     model_override: str | None,
     vad_filter: bool = False,
 ) -> None:
-    """Transcribe a session's WAV -> transcript.md, updating session.json."""
+    """Transcribe a session's WAV(s) -> transcript.md, updating session.json.
+
+    Handles one or two WAVs. If both system (recording.wav) and mic
+    (recording-mic.wav) exist, transcribes each and merges the transcripts
+    (labeled [System]/[Mic], interleaved by timestamp). Otherwise transcribes
+    the single present WAV.
+    """
     model_name = model_override or cfg.whisper_model
-    wav = session.wav_path(session_id)
+    sys_wav = session.wav_path(session_id)
+    mic_wav = session.mic_wav_path(session_id)
 
-    result = transcriber.transcribe(
-        wav, model_name=model_name, language="en", console=console, vad_filter=vad_filter
-    )
-    md = formatter.build_markdown(
-        result.segments,
-        duration_seconds=result.duration,
-        wav_filename=wav.name,
-    )
+    has_sys = sys_wav.exists()
+    has_mic = mic_wav.exists()
+    if not has_sys and not has_mic:
+        # _finish_session already handled the no-WAV case, but guard anyway.
+        raise click.ClickException(f"No recording found for session {session_id}.")
+
+    def _t(path):
+        return transcriber.transcribe(
+            path, model_name=model_name, language="en", console=console, vad_filter=vad_filter
+        )
+
+    if has_sys and has_mic:
+        sys_result = _t(sys_wav)
+        mic_result = _t(mic_wav)
+        md = formatter.build_merged_markdown(
+            system_result=sys_result,
+            mic_result=mic_result,
+            wav_filenames=(sys_wav.name, mic_wav.name),
+        )
+        duration = max(sys_result.duration, mic_result.duration)
+        word_count = transcriber.count_words(sys_result.segments) + transcriber.count_words(mic_result.segments)
+    elif has_mic:
+        # mic-only recording lives in recording-mic.wav
+        result = _t(mic_wav)
+        md = formatter.build_markdown(result.segments, duration_seconds=result.duration,
+                                      wav_filename=mic_wav.name, source="Mic")
+        duration = result.duration
+        word_count = transcriber.count_words(result.segments)
+    else:
+        result = _t(sys_wav)
+        md = formatter.build_markdown(result.segments, duration_seconds=result.duration,
+                                      wav_filename=sys_wav.name, source="System")
+        duration = result.duration
+        word_count = transcriber.count_words(result.segments)
+
     out = formatter.write_transcript(session_id, md)
-    word_count = transcriber.count_words(result.segments)
-
     session.update_meta(
         session_id,
         status=session.STATUS_TRANSCRIBED,
-        duration=result.duration,
+        duration=duration,
         word_count=word_count,
         model=model_name,
     )
-
     click.echo(
         f"Transcript: {out}\n"
-        f"Duration: {session.format_duration_human(result.duration)}  "
+        f"Duration: {session.format_duration_human(duration)}  "
         f"Words: {word_count:,}  "
-        f"Language: {result.language}"
+        f"Language: en"
     )
+
+
+def _resolve_capture(cfg: config.RecConfig, system_only: bool, mic_only: bool) -> str:
+    """Pick the capture mode from flags, falling back to config."""
+    if system_only:
+        return "system"
+    if mic_only:
+        return "mic"
+    return cfg.capture
 
 
 # ---- helpers ---------------------------------------------------------------

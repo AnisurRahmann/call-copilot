@@ -19,7 +19,8 @@ from .log import get_logger
 
 log = get_logger(__name__)
 
-RECORDING_FILENAME = "recording.wav"
+RECORDING_FILENAME = "recording.wav"          # system audio
+MIC_RECORDING_FILENAME = "recording-mic.wav"  # microphone
 SESSION_META_FILENAME = "session.json"
 TRANSCRIPT_FILENAME = "transcript.md"
 
@@ -43,6 +44,11 @@ def session_dir(session_id: str) -> Path:
 
 def wav_path(session_id: str) -> Path:
     return session_dir(session_id) / RECORDING_FILENAME
+
+
+def mic_wav_path(session_id: str) -> Path:
+    """Path to the microphone recording (used when capturing mic+system)."""
+    return session_dir(session_id) / MIC_RECORDING_FILENAME
 
 
 def session_json_path(session_id: str) -> Path:

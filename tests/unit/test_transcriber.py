@@ -259,3 +259,57 @@ def test_write_transcript_creates_file(xdg):
     assert p.exists()
     assert p.name == "transcript.md"
     assert p.read_text() == "# hello\n"
+
+
+# ---- merged mic+system formatter ------------------------------------------
+
+
+def _result(segs, duration=30.0):
+    """Build a TranscriptResult from (start, text) tuples."""
+    return transcriber.TranscriptResult(
+        segments=[transcriber.Segment(s, s + 2, t) for s, t in segs],
+        duration=duration, language="en", language_probability=0.9,
+    )
+
+
+def test_build_merged_markdown_interleaves_by_timestamp():
+    sys_segs = _result([(0.0, "hello from system"), (20.0, "system again")])
+    mic_segs = _result([(10.0, "hello from mic"), (30.0, "mic last")])
+    md = formatter.build_merged_markdown(
+        system_result=sys_segs, mic_result=mic_segs,
+        date_str="2026-07-28",
+        wav_filenames=("recording.wav", "recording-mic.wav"),
+    )
+    # Header declares both sources.
+    assert "**Sources:** System (recording.wav) + Microphone (recording-mic.wav)" in md
+    # Lines are interleaved by timestamp with source labels.
+    assert "[System] [00:00] hello from system" in md
+    assert "[Mic] [00:10] hello from mic" in md
+    assert "[System] [00:20] system again" in md
+    assert "[Mic] [00:30] mic last" in md
+    # Order: system@0, mic@10, system@20, mic@30.
+    lines = [ln for ln in md.splitlines() if ln.startswith(("[System]", "[Mic]"))]
+    assert lines == [
+        "[System] [00:00] hello from system",
+        "[Mic] [00:10] hello from mic",
+        "[System] [00:20] system again",
+        "[Mic] [00:30] mic last",
+    ]
+
+
+def test_build_merged_markdown_handles_empty_source():
+    """If one source has no speech (VAD/silence), only the other's lines appear."""
+    sys_segs = _result([(0.0, "only system spoke")])
+    mic_segs = _result([])  # mic captured nothing transcribable
+    md = formatter.build_merged_markdown(
+        system_result=sys_segs, mic_result=mic_segs, date_str="2026-07-28"
+    )
+    assert "[System] [00:00] only system spoke" in md
+    assert "[Mic]" not in md  # no mic lines
+
+
+def test_build_markdown_source_label_prefixes_lines():
+    """Single-source build_markdown tags lines when source is given."""
+    segs = [transcriber.Segment(0.0, 5.0, "hi")]
+    md = formatter.build_markdown(segs, date_str="2026-07-28", source="Mic")
+    assert "Mic [00:00] hi" in md

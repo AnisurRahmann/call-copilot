@@ -65,7 +65,7 @@ class RecConfig(BaseModel):
     channels: int = 1
     whisper_model: str = "base"
     # Reserved for future "system+mic" capture. Today only "system" is wired.
-    capture: str = "system"
+    capture: str = "mic+system"
     sessions_dir: Path = Field(default_factory=sessions_root)
 
     @field_validator("sessions_dir", mode="before")

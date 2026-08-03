@@ -23,7 +23,7 @@ def test_default_config_uses_recommended_defaults():
     # Core Audio taps default: 16kHz mono, Whisper-native (no resampling).
     assert cfg.sample_rate == 16000
     assert cfg.channels == 1
-    assert cfg.capture == "system"
+    assert cfg.capture == "mic+system"
     assert cfg.whisper_model == "base"
     # No audio-routing fields exist anymore (BlackHole/Multi-Output removed).
     assert not hasattr(cfg, "original_output_device")
@@ -40,7 +40,7 @@ def test_save_and_load_round_trip(xdg):
     loaded = config.load_config()
     assert loaded.whisper_model == "medium"
     assert loaded.sample_rate == 16000
-    assert loaded.capture == "system"
+    assert loaded.capture == "mic+system"
 
 
 def test_save_config_preserves_sessions_dir_as_tilde(xdg, tmp_path):
