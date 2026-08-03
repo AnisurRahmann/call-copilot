@@ -403,17 +403,31 @@ def _measure_true_rate(
     if measured_frames == 0 or elapsed <= 0:
         return fallback, collected
     measured = int(round(measured_frames / elapsed))
-    # Snap to the nearest common audio rate; if none is close, the measurement
-    # is unreliable (startup burstiness, silent source, etc.) — fall back.
+    return _snap_to_common_rate(measured, fallback), collected
+
+
+def _snap_to_common_rate(measured: int, fallback: int) -> int:
+    """Snap a measured sample rate to the nearest common audio rate.
+
+    If `measured` is within tolerance of a standard rate (48000/44100/32000/
+    24000/22050/16000), return that rate. Otherwise the measurement is treated
+    as unreliable (startup burstiness, silent source, scheduler jitter, etc.)
+    and we return `fallback` rather than baking a nonsense rate into the WAV.
+
+    Pure function — extracted so the snapping/fallback decision can be tested
+    deterministically without depending on a background feeder thread's ability
+    to hold a steady cadence (which is unreliable on slow/loaded CI runners).
+    """
     common_rates = (48000, 44100, 32000, 24000, 22050, 16000)
     snapped = min(common_rates, key=lambda c: abs(measured - c))
     if abs(measured - snapped) <= max(800, snapped * 0.05):  # 5% tolerance
-        return snapped, collected
+        return snapped
     # Measurement didn't match any common rate — don't trust it.
     import sys
+
     print(f"WARN: true-rate measurement {measured} Hz is not near any common "
           f"audio rate; falling back to {fallback} Hz.", file=sys.stderr, flush=True)
-    return fallback, collected
+    return fallback
 
 
 def _create_system_tap(callback, sample_rate: int, channels: int):

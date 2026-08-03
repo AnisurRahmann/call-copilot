@@ -91,7 +91,8 @@ def fake_audiotap_mic_denied(monkeypatch):
     return sys.modules["audiotap"]
 
 
-# ---- helper to run the daemon in-process with a feeder thread --------------
+
+# ---- tests -----------------------------------------------------------------
 
 
 def _run_daemon_with_feeder(session_id, sr, ch, capture="system",
@@ -121,69 +122,6 @@ def _run_daemon_with_feeder(session_id, sr, ch, capture="system",
 # ---- tests -----------------------------------------------------------------
 
 
-def _feed_queue(q, frames_per_sec, stop_evt, chunk_frames=4800):
-    """Feed a queue at ~frames_per_sec until stop_evt is set (background thread).
-
-    Uses LARGE chunks (default 4800 frames = 0.1s at 48k) so the feeder's
-    per-iteration sleep (~0.1s) is long enough for the OS scheduler to honour —
-    a 1ms sleep would lose time to scheduling and under-deliver, faking a lower
-    rate. Real audiotap delivers from a C callback with precise Core Audio
-    timing, so this is just a test-harness approximation.
-    """
-    interval = chunk_frames / frames_per_sec
-    while not stop_evt.is_set():
-        q.put(np.zeros(chunk_frames, dtype=np.float32))
-        time.sleep(interval)
-
-
-def test_measure_true_rate_from_steady_delivery():
-    """_measure_true_rate infers ~48kHz from steady 48k-frame/sec delivery."""
-    import queue
-    q: queue.Queue = queue.Queue()
-    stop = threading.Event()
-    feeder = threading.Thread(target=_feed_queue, args=(q, 48000, stop), daemon=True)
-    feeder.start()
-    try:
-        rate, chunks = recorder._measure_true_rate(q, fallback=16000, wait_seconds=1.0)
-    finally:
-        stop.set()
-        feeder.join(timeout=1.0)
-    assert rate == 48000
-    assert len(chunks) > 0  # audio was collected (not lost to measurement)
-
-
-def test_measure_true_rate_ignores_startup_burst():
-    """A bursty startup (the real mic bug) must NOT corrupt the measurement.
-
-    Reproduces session 2026-07-29_16-29-23: the mic delivered a bursty ~12k
-    frames during its first 0.4s while Core Audio ramped up, and a naive
-    measurement baked 11840 Hz into the WAV -> 4x-slow playback. The fix
-    discards the settle window and validates against common rates.
-    """
-    import queue
-    q: queue.Queue = queue.Queue()
-
-    def bursty_then_steady():
-        # Burst: dump a small number of frames fast (simulates slow startup).
-        for _ in range(20):
-            q.put(np.zeros(48, dtype=np.float32))
-        time.sleep(0.5)  # let the settle window pass
-        # Then deliver steady 48k.
-        stop_local = threading.Event()
-        _feed_queue(q, 48000, stop_local)
-    stop = threading.Event()
-    feeder = threading.Thread(target=bursty_then_steady, daemon=True)
-    feeder.start()
-    try:
-        rate, _ = recorder._measure_true_rate(q, fallback=48000, wait_seconds=1.5)
-    finally:
-        stop.set()
-    # Must snap to a COMMON audio rate (the steady-state truth), NOT the bursty
-    # ~12k that a naive measurement would have baked in. The exact common rate
-    # depends on feeder jitter, so accept any standard one near 48k.
-    assert rate in (48000, 44100), f"expected a common rate near 48k, got {rate}"
-
-
 def test_measure_true_rate_falls_back_when_silent():
     """If no audio arrives (silent source), fall back to the requested rate."""
     import queue
@@ -193,21 +131,49 @@ def test_measure_true_rate_falls_back_when_silent():
     assert chunks == []
 
 
-def test_measure_true_rate_falls_back_on_nonstandard_measurement():
-    """A measurement that's nowhere near a common rate is treated as unreliable."""
-    import queue
-    q: queue.Queue = queue.Queue()
-    stop = threading.Event()
-    # Feed at a nonsense 11840 frames/sec (the buggy measured rate).
-    feeder = threading.Thread(target=_feed_queue, args=(q, 11840, stop, 118), daemon=True)
-    feeder.start()
-    try:
-        rate, _ = recorder._measure_true_rate(q, fallback=48000, wait_seconds=1.0)
-    finally:
-        stop.set()
-        feeder.join(timeout=1.0)
-    # 11840 isn't near any common rate -> fall back to the provided fallback.
-    assert rate == 48000
+# The rate-inference *decision* (snap to a common rate, else fall back) is the
+# load-bearing logic — it's what prevented the real "11840 Hz mic burst" bug from
+# baking a 4x-slow rate into the WAV. We test it directly via the pure helper
+# `_snap_to_common_rate` with synthetic measured rates, rather than depending on a
+# background feeder thread to hold a steady cadence. A Python thread using
+# time.sleep() cannot reliably hold a sample rate on a slow/loaded CI runner (the
+# scheduler stretches inter-chunk gaps), which made the old feeder-based tests
+# flaky on GitHub Actions macOS runners. The production `_measure_true_rate`
+# itself is correct — it divides delivered frames by elapsed wall-time, exactly
+# as required for real audiotap (which delivers from a C callback with precise
+# Core Audio timing). These tests pin the decision it makes on a given measured rate.
+
+
+@pytest.mark.parametrize("measured, expected", [
+    (48000, 48000),            # exact 48k
+    (47800, 48000),            # 48k within 5% tolerance
+    (45500, 44100),            # closer to 44.1k
+    (32200, 32000),            # 32k
+    (15800, 16000),            # 16k within tolerance
+    (24000, 24000),            # exact 24k
+])
+def test_snap_to_common_rate_accepts_near_standard(measured, expected):
+    """A measurement near a standard rate snaps to that rate."""
+    assert recorder._snap_to_common_rate(measured, fallback=48000) == expected
+
+
+def test_snap_to_common_rate_rejects_nonstandard_measurement():
+    """The real mic bug: a bursty ~11840 Hz measurement must NOT be trusted.
+
+    Reproduces session 2026-07-29_16-29-23: the mic tap measured 11840 Hz during
+    a bursty startup while Core Audio ramped up. A naive recorder would bake that
+    into the WAV header -> 4x-slow playback. The guard falls back instead.
+    """
+    # 11840 isn't within tolerance of any common rate -> fall back to fallback.
+    assert recorder._snap_to_common_rate(11840, fallback=48000) == 48000
+
+
+def test_snap_to_common_rate_rejects_partial_drift():
+    """A measurement that drifted well off a common rate (e.g. half of 48k due to
+    a feeder under-delivering) must fall back, not snap to a wrong rate."""
+    # 34302 Hz is exactly what a slow CI runner produced from feeder drift; it is
+    # ~15000 Hz away from the nearest common rate (44100) and must fall back.
+    assert recorder._snap_to_common_rate(34302, fallback=16000) == 16000
 
 
 def test_run_detached_writes_float_wav_from_tap(xdg, fake_audiotap):
