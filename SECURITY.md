@@ -11,7 +11,7 @@ privately so it can be triaged before public disclosure. Use one of:
    [github.com/AnisurRahmann/call-copilot/security/advisories/new](https://github.com/AnisurRahmann/call-copilot/security/advisories/new)
    and select "Report a vulnerability." (This requires the repository's
    *Private vulnerability reporting* setting to be enabled — see the note below.)
-2. **Email**: send details to **shakilwizard@gmail.com** with `[call-copilot
+2. **Email**: send details to **pshakilwizard@gmail.com** with `[call-copilot
    security]` in the subject line.
 
 Please include, where possible:
