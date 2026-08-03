@@ -5,20 +5,21 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-*.egg
 .eggs/
+*.egg
 
-# Virtual environment
+# Virtual environments
 .venv/
 venv/
 
-# Testing
+# Testing / type-checking
 .pytest_cache/
 .coverage
 htmlcov/
 .mypy_cache/
+.ruff_cache/
 
-# IDE
+# IDE / editors
 .vscode/
 .idea/
 *.swp
@@ -30,9 +31,12 @@ Thumbs.db
 
 # Environment
 .env
+.env.*
 
-# Project specific
-sessions/*.jsonl
+# Recorded audio + transcripts (sessions live under ~/.local/share/rec/sessions/,
+# outside this repo — these globs are a safety net in case a path is overridden).
+recordings/
+sessions/
 *.wav
 *.mp3
 *.m4a
@@ -44,23 +48,11 @@ sessions/*.jsonl
 *.aiff
 *.pcm
 *.opus
-
-# Recordings and audio data
-recordings/
-sessions/
 *.pid
-recorder.log
-*.webm
-*.ogg
-*.flac
-*.aac
-*.wma
-*.aiff
-*.pcm
-*.opus
+*.log
 
-# Recordings and audio data
-recordings/
-sessions/
-*.pid
-recorder.log
+# Whisper model weights (downloaded on first run)
+models/
+
+# Local agent scratch / tooling
+.zcode/

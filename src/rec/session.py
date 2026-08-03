@@ -12,7 +12,6 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from . import config
 from .log import get_logger
@@ -30,7 +29,7 @@ STATUS_RECORDED = "recorded"
 STATUS_TRANSCRIBED = "transcribed"
 
 
-def new_session_id(now: Optional[datetime] = None) -> str:
+def new_session_id(now: datetime | None = None) -> str:
     """`YYYY-MM-DD_HH-MM-SS` — filesystem-safe, sorts chronologically."""
     now = now or datetime.now()
     sid = now.strftime("%Y-%m-%d_%H-%M-%S")
@@ -72,16 +71,16 @@ class SessionMeta:
     started_at: str  # ISO 8601
     status: str = STATUS_RECORDING
     original_device: str = ""
-    duration: Optional[float] = None  # seconds
-    word_count: Optional[int] = None
-    model: Optional[str] = None
+    duration: float | None = None  # seconds
+    word_count: int | None = None
+    model: str | None = None
     extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-def load_meta(session_id: str) -> Optional[SessionMeta]:
+def load_meta(session_id: str) -> SessionMeta | None:
     path = session_json_path(session_id)
     if not path.exists():
         return None
@@ -141,7 +140,7 @@ def list_sessions() -> list[SessionMeta]:
 # ---- formatters -----------------------------------------------------------
 
 
-def format_duration_human(seconds: Optional[float]) -> str:
+def format_duration_human(seconds: float | None) -> str:
     """47 minutes / 1 hour 3 minutes / 0 minutes / -- (None)."""
     if seconds is None:
         return "--"

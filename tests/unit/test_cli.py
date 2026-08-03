@@ -9,9 +9,8 @@ from __future__ import annotations
 import pytest
 from click.testing import CliRunner
 
-from rec import cli, config, recorder, session, transcriber
+from rec import cli, config, recorder, session
 from rec.transcriber import Segment, TranscriptResult
-
 
 # ---- fixtures --------------------------------------------------------------
 
@@ -157,7 +156,6 @@ def test_start_default_enters_live_ui_then_finishes(monkeypatch, cfg_written, fa
     # The live UI was entered (it owns the stop+transcribe; we stub it here and
     # test that flow separately in test_run_live_recording_finishes_on_keyboard_interrupt).
     assert len(live_calls) == 1
-    sid = live_calls[0][0]
     assert live_calls[0][1] == "small"   # --model flowed through
     assert live_calls[0][2] is True      # --vad flowed through
 

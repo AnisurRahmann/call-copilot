@@ -2,9 +2,10 @@
 
 > One thing. Done really well. Record meetings. Save transcripts. Don't break audio.
 
-Call Copilot is a terminal command (`rec`) that silently records your meeting audio in
-the background, and when you stop it, transcribes the recording locally and saves a
-clean markdown transcript.
+Call Copilot is a terminal command (`rec`) that records your meeting audio and, when you
+stop it, transcribes locally and saves a clean markdown transcript. **Everything runs on
+your machine** — no cloud, no API keys, no account. Audio and transcripts never leave the
+computer.
 
 ```
 $ rec setup         # one-time: verify macOS + grant capture permission
@@ -56,15 +57,30 @@ recording.wav ──> faster-whisper (local, free) ──> transcript.md
 
 ## Requirements
 
-- **macOS 14.2 or later** (Core Audio taps API). Apple Silicon recommended.
+- **macOS 14.2 or later** (Core Audio process taps API). Apple Silicon recommended.
 - Python 3.11+.
 
 No Homebrew packages, no audio drivers, no manual Audio MIDI Setup. Just `pip install`.
 
+## Recording consent & privacy
+
+Call Copilot records audio from your meetings, which may include **other participants**.
+Recording laws vary by jurisdiction and many require the consent of everyone being
+recorded (one-party vs. all-party consent). **Obtaining that consent is your
+responsibility** — check your local laws and your organization's policy before recording.
+
+On the technical side, your data stays put:
+
+- Transcription runs **100% locally** with faster-whisper (CPU, int8) — no API, no cloud.
+- **Audio and transcripts never leave your machine.** The only network access is the
+  first run of a given Whisper model, which downloads its weights from Hugging Face;
+  after that it's fully offline.
+- Recordings live under `~/.local/share/rec/sessions/` (XDG data home), outside any repo.
+
 ## Install
 
 ```bash
-git clone <this repo> && cd call-copilot
+git clone https://github.com/AnisurRahmann/call-copilot.git && cd call-copilot
 make install          # creates .venv and installs `rec`
 ```
 
@@ -208,9 +224,23 @@ by a debugging checklist. (`rec diagnose` accepts a unique prefix too, e.g. `202
 make test            # unit tests (89, offline — no audio device or model download needed)
 ```
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, code style, and pull-request
+expectations.
+
+## Contributing
+
+Issues and pull requests are welcome at
+[github.com/AnisurRahmann/call-copilot](https://github.com/AnisurRahmann/call-copilot).
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR, and report security
+issues privately per [SECURITY.md](SECURITY.md).
+
 ## What this is NOT
 
 - Not a real-time transcription tool (transcription happens after you stop).
 - Not a meeting summarizer (just the transcript).
 - Not a Zoom/Meet plugin (it captures system audio generically).
 - Not cross-platform (macOS 14.2+ only).
+
+## License
+
+MIT — see [LICENSE](LICENSE). © Anisur Rahman.

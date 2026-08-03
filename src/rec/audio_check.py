@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from .log import get_logger
 
@@ -48,7 +47,7 @@ class AudioLevels:
         return self.frames / self.sample_rate if self.sample_rate else 0.0
 
 
-def analyze_wav(wav_path: str | Path) -> Optional[AudioLevels]:
+def analyze_wav(wav_path: str | Path) -> AudioLevels | None:
     """Stream a WAV and compute peak + rms. Returns None if unreadable/empty.
 
     Reads as float64 (soundfile normalizes PCM/float to double for us). The

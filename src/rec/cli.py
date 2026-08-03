@@ -26,8 +26,7 @@ import rich.box
 from rich.console import Console
 from rich.table import Table
 
-from . import __version__
-from . import audio_check, config, formatter, recorder, session, transcriber
+from . import __version__, audio_check, config, formatter, recorder, session, transcriber
 from . import log as log_mod
 
 console = Console()
@@ -148,7 +147,7 @@ def setup(default_model: str) -> None:
     except Exception:
         mic_status = "UNKNOWN"
     if mic_status == "GRANTED":
-        click.echo(f"[ok] Microphone permission: GRANTED")
+        click.echo("[ok] Microphone permission: GRANTED")
     else:
         click.echo(f"[--] Microphone permission: {mic_status} (needed to record YOUR voice)")
         click.echo("  Grant it in System Settings > Privacy & Security > Microphone,")
@@ -242,7 +241,6 @@ def _run_live_recording(
 ) -> None:
     """Show a live ● REC indicator (elapsed + file size) until Ctrl+C, then finish."""
     from rich.live import Live
-    from rich.panel import Panel
     from rich.text import Text
 
     meta = session.load_meta(session_id)

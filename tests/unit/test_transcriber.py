@@ -7,9 +7,9 @@ without downloading any weights or touching a real audio device.
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Iterable
 
 import numpy as np
 import pytest
@@ -51,8 +51,7 @@ class _FakeModel:
         self.audio_arg = audio
 
         def _gen():
-            for s in self._segments:
-                yield s
+            yield from self._segments
 
         return _gen(), self.info
 
@@ -97,7 +96,7 @@ def test_transcribe_passes_anti_hallucination_kwargs():
     fake = _FakeModel(_make_segments(), _FakeInfo(duration=30.0, language="en", language_probability=0.9))
     transcriber.transcribe("/tmp/x.wav", model=fake, console=None, _audio=_FAKE_AUDIO)
     kw = fake.kwargs
-    # Per DEPS gotchas: prevent hallucination loops on long silences.
+    # Prevent hallucination loops on long silences.
     assert kw["condition_on_previous_text"] is False
     assert kw["hallucination_silence_threshold"] == 2.0
     # VAD defaults to OFF — Silero VAD rejects system-audio capture (different

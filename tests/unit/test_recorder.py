@@ -19,7 +19,6 @@ import pytest
 
 from rec import config, recorder, session
 
-
 # ---- fake audiotap ---------------------------------------------------------
 
 
@@ -147,7 +146,8 @@ def test_measure_true_rate_from_steady_delivery():
     try:
         rate, chunks = recorder._measure_true_rate(q, fallback=16000, wait_seconds=1.0)
     finally:
-        stop.set(); feeder.join(timeout=1.0)
+        stop.set()
+        feeder.join(timeout=1.0)
     assert rate == 48000
     assert len(chunks) > 0  # audio was collected (not lost to measurement)
 
@@ -204,7 +204,8 @@ def test_measure_true_rate_falls_back_on_nonstandard_measurement():
     try:
         rate, _ = recorder._measure_true_rate(q, fallback=48000, wait_seconds=1.0)
     finally:
-        stop.set(); feeder.join(timeout=1.0)
+        stop.set()
+        feeder.join(timeout=1.0)
     # 11840 isn't near any common rate -> fall back to the provided fallback.
     assert rate == 48000
 

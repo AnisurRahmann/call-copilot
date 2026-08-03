@@ -2,7 +2,26 @@
 name = "call-copilot"
 version = "0.1.0"
 description = "Call Copilot — silently record meeting audio in the background, then transcribe locally to clean markdown."
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.11"
+authors = [
+    { name = "Anisur Rahman", email = "shakilwizard@gmail.com" },
+]
+keywords = ["audio", "transcription", "whisper", "meeting", "recorder", "macos", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: MacOS X",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
 dependencies = [
     "click>=8.1",
     "audiotap>=0.0.2",
@@ -13,10 +32,16 @@ dependencies = [
     "numpy>=1.24",
 ]
 
+[project.urls]
+Homepage = "https://github.com/AnisurRahmann/call-copilot"
+Repository = "https://github.com/AnisurRahmann/call-copilot"
+Issues = "https://github.com/AnisurRahmann/call-copilot/issues"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-mock>=3.0",
+    "ruff>=0.6",
 ]
 
 [project.scripts]
@@ -36,3 +61,18 @@ addopts = "-q"
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+
+[tool.ruff.lint]
+# A focused, achievable baseline. The full default rule set (which includes
+# bandit-style S, timezone DTZ, and exception-message TRY rules) is aspirational
+# and not yet clean across the tree; tighten this as the codebase catches up.
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes (unused imports/vars, undefined names — real bugs)
+    "I",   # isort (import ordering)
+    "UP",  # pyupgrade (modern syntax)
+    "W",   # pycodestyle warnings
+]
+ignore = [
+    "E501",  # line length handled by line-length + formatter, not enforced per-line
+]

@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
-from rec import cli, config, log as log_mod, session
-
+from rec import cli, config, session
+from rec import log as log_mod
 
 # ---- failure logging via main() -------------------------------------------
 
@@ -135,7 +134,7 @@ def test_diagnose_includes_error_lines_regardless_of_session(cfg_written, xdg):
     log_mod.set_command_context("stop")
     log_mod.get_logger("rec.test").error("a real failure")
 
-    res = CliRunner().invoke(cli.cli, ["diagnose", sid])
+    CliRunner().invoke(cli.cli, ["diagnose", sid])
     text = (session.session_dir(sid) / "diagnose.md").read_text()
     assert "a real failure" in text
 
@@ -165,6 +164,6 @@ def test_diagnose_global_log_lines_limit_truncates(cfg_written, xdg):
     logger = log_mod.get_logger("rec.test")
     for i in range(50):
         logger.info("line %d", i)
-    res = CliRunner().invoke(cli.cli, ["diagnose", sid, "--global-log-lines", "10"])
+    CliRunner().invoke(cli.cli, ["diagnose", sid, "--global-log-lines", "10"])
     text = (session.session_dir(sid) / "diagnose.md").read_text()
     assert "lines omitted" in text  # truncation marker present

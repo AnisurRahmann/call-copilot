@@ -19,8 +19,8 @@ Output shape (per spec):
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import date
-from typing import Iterable
 
 from . import session as session_mod
 from .log import get_logger

@@ -1,28 +1,25 @@
 """faster-whisper wrapper with a Rich progress bar.
 
-Honors DEPS.md §5 gotchas:
+Notes on the faster-whisper API as used here:
   - segments is a LAZY generator; we must iterate it (the for-loop below
     is what actually runs the transcription).
   - Apple Silicon has no Metal/MPS backend: device='cpu', compute_type='int8'.
   - condition_on_previous_text=False + hallucination_silence_threshold=2.0
     to avoid the "Thank you." repetition loop on long silences.
-  - vad_filter=True to skip long silences (faster, cleaner output).
-  - The README's beam_size_realtime param does NOT exist — we don't use it.
+  - vad_filter=False by default (Silero VAD aggressively rejects system-audio
+    capture; see README's VAD note). Enable per run with --vad.
   - info.duration is known up-front (before iterating), so we can show a
     real determinate progress bar driven by segment end-times.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Protocol
+from typing import Any, Protocol
 
 from rich.console import Console
-
-from .log import get_logger
-
-log = get_logger(__name__)
 from rich.progress import (
     BarColumn,
     Progress,
@@ -31,6 +28,10 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
+
+from .log import get_logger
+
+log = get_logger(__name__)
 
 
 @dataclass
@@ -62,7 +63,7 @@ def load_model(model_name: str, compute_type: str = "int8") -> _WhisperLike:
     return WhisperModel(model_name, device="cpu", compute_type=compute_type)
 
 
-def prepare_audio_for_whisper(wav_path: str | Path) -> tuple["numpy.ndarray", int]:
+def prepare_audio_for_whisper(wav_path: str | Path) -> tuple[Any, int]:
     """Load a WAV and return float32 mono 16kHz data for Whisper.
 
     The recorder captures at the device's native rate (audiotap ignores the
@@ -92,10 +93,10 @@ def transcribe(
     wav_path: str | Path,
     model_name: str = "base",
     language: str = "en",
-    model: Optional[_WhisperLike] = None,
-    console: Optional[Console] = None,
+    model: _WhisperLike | None = None,
+    console: Console | None = None,
     vad_filter: bool = False,
-    _audio: Optional[tuple] = None,
+    _audio: tuple | None = None,
 ) -> TranscriptResult:
     """Transcribe a WAV file. `model` lets tests inject a fake (no download).
 

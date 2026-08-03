@@ -9,7 +9,6 @@ import pytest
 
 from rec import log as log_mod
 
-
 # ---- level mapping ---------------------------------------------------------
 
 
