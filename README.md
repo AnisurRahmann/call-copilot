@@ -7,6 +7,8 @@ stop it, transcribes locally and saves a clean markdown transcript. **Everything
 your machine** — no cloud, no API keys, no account. Audio and transcripts never leave the
 computer.
 
+![Call Copilot demo](docs/demo.gif)
+
 ```
 $ rec setup         # one-time: verify macOS + grant capture permission
 $ rec start         # starts recording, you keep working
