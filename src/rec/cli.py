@@ -110,10 +110,25 @@ def _macos_version_tuple() -> tuple[int, int]:
     show_default=True,
     help="Default whisper model for transcription (tiny/base/small/medium/large-v3).",
 )
-def setup(default_model: str) -> None:
-    """One-time setup: verify macOS + audiotap + capture permission."""
+@click.option(
+    "--selftest/--no-selftest",
+    "selftest",
+    default=True,
+    help="Run a live capture probe (default on) — opens the taps for a couple "
+         "of seconds to confirm they actually receive audio. Pass --no-selftest "
+         "to skip in CI/automated runs.",
+)
+@click.option(
+    "--selftest-duration",
+    type=float,
+    default=2.0,
+    show_default=True,
+    help="Seconds to open each tap during the capture self-test.",
+)
+def setup(default_model: str, selftest: bool, selftest_duration: float) -> None:
+    """One-time setup: verify macOS + audiotap + capture permission + a live tap."""
     log = log_mod.get_logger(__name__)
-    log.info("running setup (default_model=%s)", default_model)
+    log.info("running setup (default_model=%s selftest=%s)", default_model, selftest)
 
     # 1. macOS version — Core Audio taps require 14.2+.
     major, minor = _macos_version_tuple()
@@ -161,8 +176,75 @@ def setup(default_model: str) -> None:
     click.echo("  Grant it under System Settings > Privacy & Security > Screen Recording")
     click.echo("  (system audio capture is grouped with screen recording).")
     click.echo("  After toggling it ON for your terminal app, QUIT and reopen the app.")
+
+    # 6. Live capture self-test — the most important check. A tap that runs
+    # but returns all-zero samples is the #1 silent-recording cause, and it's
+    # invisible without actually opening the tap. This catches a permission
+    # that's checked but not honored (needs an app restart) before a meeting.
     click.echo("")
-    click.echo("Setup complete. Run `rec start` to begin recording.")
+    if not selftest:
+        click.echo("[skipped] live capture self-test (--no-selftest).")
+        click.echo("Setup complete. Run `rec start` to begin recording.")
+        return
+
+    _run_capture_selftest(cfg, selftest_duration)
+
+
+def _run_capture_selftest(cfg: config.RecConfig, duration: float) -> None:
+    """Open each tap in the configured capture for `duration` and report peak.
+
+    The system probe needs the user to play something during the window; the
+    mic probe needs them to speak. We can't force either, so we PRINT the
+    instructions, wait the configured duration, then judge the result — a
+    near-zero peak gets a clear FAIL with the restart-app guidance.
+    """
+    sources = sorted(recorder._parse_capture(cfg.capture))
+    problems = False
+    for src in sources:
+        if src == "system":
+            click.echo(
+                f"[..] Probing SYSTEM audio for {duration:.0f}s — play some audio NOW "
+                f"(music, a video, `say hello`) so the tap has something to capture."
+            )
+        else:
+            click.echo(
+                f"[..] Probing MICROPHONE for {duration:.0f}s — speak NOW so the tap "
+                f"has something to capture."
+            )
+        probe = recorder.probe_capture(src, duration)
+        if not probe.created:
+            click.secho(
+                f"[FAIL] {src} tap could not be created: {probe.error}",
+                fg="red",
+            )
+            problems = True
+            continue
+        if probe.peak < audio_check.SILENCE_PEAK_THRESHOLD:
+            click.secho(
+                f"[FAIL] {src} tap captured only silence "
+                f"(peak={probe.peak:.6f}, {probe.frames:,} frames). The permission "
+                f"is checked but macOS is handing the running process zero buffers. "
+                f"Toggle the permission ON, then FULLY QUIT and reopen this terminal "
+                f"app, then run `rec setup` again.",
+                fg="red",
+            )
+            problems = True
+        else:
+            click.secho(
+                f"[ok] {src} tap captured audio (peak={probe.peak:.4f}, "
+                f"{probe.frames:,} frames).",
+                fg="green",
+            )
+
+    click.echo("")
+    if problems:
+        click.secho(
+            "Setup incomplete — at least one capture source is silent. Fix the "
+            "permissions above (and restart the terminal app) before recording.",
+            fg="yellow",
+        )
+    else:
+        click.echo("Setup complete. Run `rec start` to begin recording.")
 
 
 # ---- start -----------------------------------------------------------------
@@ -206,6 +288,21 @@ def start(model: str | None, vad: bool, detach: bool, system_only: bool, mic_onl
 
     cfg = config.load_config()
     capture = _resolve_capture(cfg, system_only, mic_only)
+
+    # If the mic is part of the capture but its permission isn't granted, warn
+    # up front (in the terminal) — the recorder would otherwise skip it
+    # silently and the warning would only land in the daemon log. The user
+    # thinks they're recording both sources when they're really only getting
+    # system audio.
+    if "mic" in _parse_capture_for_cli(capture) and not _mic_permission_granted():
+        click.secho(
+            "Microphone permission is not granted — the mic will be SKIPPED and "
+            "only system audio will be recorded. Grant microphone access for "
+            "this terminal app in System Settings > Privacy & Security > "
+            "Microphone, then quit + reopen the app. Or record system audio "
+            "only with `rec start --system-only`.",
+            fg="yellow", err=True,
+        )
 
     session_id = session.new_session_id()
     log_mod.set_session_context(session_id)
@@ -326,14 +423,21 @@ def _finish_session(
     Shared by `rec stop` (finds the active session itself) and `rec start`
     (knows its session id after Ctrl+C). Assumes the recorder daemon has
     already been signaled to stop.
+
+    If every captured WAV is silent, transcription is SKIPPED: Whisper on pure
+    silence hallucinates text (e.g. a repeated "You"), which is worse than no
+    transcript. The session is marked SILENT instead. The WAV is kept on disk
+    so `rec diagnose` can inspect it. If only one source of a mic+system
+    recording is silent, the other still gets transcribed.
     """
     log_mod.set_session_context(session_id)
 
     wav = session.wav_path(session_id)
-    if not wav.exists():
-        # The daemon was stopped before it opened the WAV (very fast Ctrl+C, or
-        # it crashed at startup). Nothing to transcribe — say so clearly rather
-        # than crashing, and mark the session so `rec list` reflects reality.
+    mic_wav = session.mic_wav_path(session_id)
+    if not wav.exists() and not mic_wav.exists():
+        # The daemon was stopped before it opened either WAV (very fast Ctrl+C,
+        # or it crashed at startup). Nothing to transcribe — say so clearly
+        # rather than crashing, and mark the session so `rec list` reflects it.
         session.update_meta(session_id, status=session.STATUS_RECORDED, duration=0.0, word_count=0)
         click.secho(
             "No audio was captured (stopped too quickly, or the tap failed to start). "
@@ -345,24 +449,77 @@ def _finish_session(
     # Check audio levels BEFORE transcribing. A silent recording means nothing
     # was playing (or the permission was revoked) — flag it loudly instead of
     # letting Whisper silently produce an empty transcript.
-    levels = audio_check.analyze_wav(wav)
-    if levels is not None:
-        meta = session.load_meta(session_id)
-        if meta is not None:
-            meta.extra["audio_peak"] = round(levels.peak, 6)
-            meta.extra["audio_rms"] = round(levels.rms, 6)
-            meta.extra["audio_silent"] = levels.silent
-            session.save_meta(meta)
-        if levels.silent:
-            click.secho(
-                f"⚠  WARNING: recording is silent (peak={levels.peak:.6f}, rms={levels.rms:.6f}).\n"
-                f"   The audio tap captured no signal — either nothing was playing,\n"
-                f"   or macOS revoked the capture permission. Run `rec setup`, then\n"
-                f"   record again while audio is actually playing.",
-                fg="yellow", err=True,
-            )
+    sys_levels = audio_check.analyze_wav(wav) if wav.exists() else None
+    mic_levels = audio_check.analyze_wav(mic_wav) if mic_wav.exists() else None
+    meta = session.load_meta(session_id)
+    if meta is not None:
+        if sys_levels is not None:
+            meta.extra["audio_peak"] = round(sys_levels.peak, 6)
+            meta.extra["audio_rms"] = round(sys_levels.rms, 6)
+            meta.extra["audio_silent"] = sys_levels.silent
+        if mic_levels is not None:
+            # Store the mic's levels separately so both are diagnosable.
+            meta.extra["mic_audio_peak"] = round(mic_levels.peak, 6)
+            meta.extra["mic_audio_rms"] = round(mic_levels.rms, 6)
+            meta.extra["mic_audio_silent"] = mic_levels.silent
+        session.save_meta(meta)
+
+    _warn_if_silent(sys_levels, mic_levels)
+
+    # Skip transcription only if EVERY captured source is silent. In a
+    # mic+system recording where the system tap went silent but the mic heard
+    # the user, we still transcribe the mic.
+    all_present_silent = all(
+        lv.silent for lv in (sys_levels, mic_levels) if lv is not None
+    )
+    if all_present_silent:
+        # Pick a representative duration for the record (longest capture).
+        dur = max(
+            (lv.duration_seconds for lv in (sys_levels, mic_levels) if lv is not None),
+            default=0.0,
+        )
+        session.update_meta(
+            session_id, status=session.STATUS_SILENT, duration=dur, word_count=0
+        )
+        click.secho(
+            "Skipping transcription: the recording is silent. "
+            "Whisper would hallucinate text on a zero-signal file, so nothing "
+            "was transcribed. The WAV is kept for `rec diagnose`. "
+            "Fix the capture (see warning above), then record again.",
+            fg="yellow", err=True,
+        )
+        return
 
     _transcribe_session(session_id, cfg, model_override=model_override, vad_filter=vad_filter)
+
+
+def _warn_if_silent(sys_levels, mic_levels) -> None:
+    """Print a yellow warning for each silent source with tailored guidance."""
+    for label, lv in (("System", sys_levels), ("Microphone", mic_levels)):
+        if lv is None or not lv.silent:
+            continue
+        if lv.frames > 0 and lv.peak == 0.0:
+            # The permission-revoked / not-yet-honored signature.
+            click.secho(
+                f"⚠  WARNING: {label} recording is silent "
+                f"(peak={lv.peak:.6f}, rms={lv.rms:.6f}, {lv.frames:,} frames).\n"
+                f"   The tap ran but captured literally zero samples. This is the\n"
+                f"   macOS capture-permission signature: toggle the relevant\n"
+                f"   permission ON for your terminal app (Screen Recording for\n"
+                f"   system audio, Microphone for the mic) in System Settings >\n"
+                f"   Privacy & Security, then FULLY QUIT and reopen the app. Then\n"
+                f"   run `rec setup` to verify.",
+                fg="yellow", err=True,
+            )
+        else:
+            click.secho(
+                f"⚠  WARNING: {label} recording is silent "
+                f"(peak={lv.peak:.6f}, rms={lv.rms:.6f}).\n"
+                f"   The tap captured no usable signal — either nothing was\n"
+                f"   playing, or the permission was revoked. Run `rec setup`,\n"
+                f"   then record again while audio is actually playing.",
+                fg="yellow", err=True,
+            )
 
 
 # ---- list ------------------------------------------------------------------
@@ -596,6 +753,32 @@ def _resolve_capture(cfg: config.RecConfig, system_only: bool, mic_only: bool) -
     if mic_only:
         return "mic"
     return cfg.capture
+
+
+def _parse_capture_for_cli(capture: str) -> set[str]:
+    """CLI-side view of a capture mode -> set of sources.
+
+    Thin wrapper over recorder._parse_capture so the start command can tell
+    whether the mic is in play (to warn if its permission is missing) without
+    duplicating the mode-string parsing.
+    """
+    return recorder._parse_capture(capture)
+
+
+def _mic_permission_granted() -> bool:
+    """True if the mic permission is already granted (not promptable).
+
+    Deliberately more conservative than recorder._mic_available: the start-time
+    warning should fire whenever the user would NOT get an auto-prompt, i.e. the
+    permission is anything other than already-GRANTED. (UNKNOWN may prompt at
+    tap time, so we don't pre-warn for it.)
+    """
+    try:
+        import audiotap
+
+        return audiotap.mic_permission_status() == audiotap.Permission.GRANTED
+    except Exception:  # pragma: no cover — audiotap missing/broken
+        return False
 
 
 # ---- helpers ---------------------------------------------------------------

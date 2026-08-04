@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 import click
@@ -145,9 +146,13 @@ def run_detached(session_id: str, sample_rate: int, channels: int, capture: str)
 
     try:
         wanted = _parse_capture(capture)
-        # Build recorders but start them in order: system first so its measured
-        # true rate can serve as the mic's fallback (they share Core Audio's
-        # clock domain, so the rates are almost always identical).
+        # Build recorders. Each source detects + writes at its OWN true rate.
+        # NOTE: the mic and system taps do NOT reliably share a delivery rate,
+        # so we never use one source's measured rate as another's fallback —
+        # a wrong fallback header (e.g. 48k on a 16k mic stream) makes the WAV
+        # play back at the wrong speed. Each source falls back to the requested
+        # sample_rate, and _measure_true_rate re-measures over longer windows
+        # before ever reaching that fallback.
         sys_recorder = None
         if "system" in wanted:
             wav = session.wav_path(session_id)
@@ -174,18 +179,13 @@ def run_detached(session_id: str, sample_rate: int, channels: int, capture: str)
                 "(no system tap and mic not permitted)"
             )
 
-        # Start the system recorder first; its measured true rate becomes the
-        # mic's fallback (far better than the requested 16k when measurement
-        # is unreliable, since both run at the device's native ~48k).
+        # Start the system recorder first (it's the more reliable clock), then
+        # the mic. Each falls back to the REQUESTED rate — never the other's.
         if sys_recorder is not None:
             sys_recorder.start()
-            mic_fallback = sys_recorder.true_rate
-        else:
-            mic_fallback = sample_rate
         for r in recorders:
             if r is sys_recorder:
                 continue
-            r.fallback_rate = mic_fallback
             r.start()
 
         # Block until SIGTERM/SIGINT, then stop them all (drain + close).
@@ -357,53 +357,109 @@ def _measure_true_rate(
     """Measure a tap's true delivery rate and return (rate, all_chunks_seen).
 
     audiotap ignores the requested sample_rate and delivers at the device's
-    native rate. We measure it empirically, but with two guards learned from a
-    real bug (a mic tap measured 11840 Hz during startup burstiness, producing
-    a 4x-slow WAV):
+    native rate. We measure it empirically, with guards learned from two real
+    bugs, both caused by a mic tap delivering BURSTY, irregular frames while
+    Core Audio ramps up:
 
-      1. DISCARD a startup-settling window (~0.4s) BEFORE measuring — Core Audio
-         delivers bursty/irregular frames while a tap ramps up, which corrupts
-         a naive measurement. Those frames are still collected and returned so
-         NO audio is lost; they're just excluded from the rate math.
-      2. VALIDATE the result against common audio rates. If the measurement
-         isn't within tolerance of a standard rate (48000/44100/32000/24000/
-         22050/16000), it's almost certainly a bad measurement — fall back to
-         `fallback` rather than baking a nonsense rate into the WAV header.
+      - 11840 Hz burst (session 2026-07-29): a naive measurement was TRUSTED
+        and baked into the header -> 4x-slow playback.
+      - 14097 Hz burst (session 2026-08-04): the measurement was correctly
+        REJECTED, but the fallback was the SYSTEM tap's 48000 Hz (borrowed
+        because mic+system "share a clock domain"). The mic's true rate was
+        ~16000, so a 48000 header made it play 3x too fast (chipmunk voice).
 
-    `wait_seconds` is the total time spent (settling + measurement).
+    The fix: NEVER fall back to another source's rate. Instead, if the first
+    short measurement doesn't snap to a common rate, RE-MEASURE over a longer
+    window. Burstiness averages out as the window grows, so the measurement
+    converges on the true rate. All observed chunks are collected and returned
+    regardless, so NO audio is lost to measurement.
+
+    `wait_seconds` is the INITIAL measurement budget (settling + first window).
+    Extra retries add time but only trigger when the source is genuinely bursty.
     """
-    import time
-
     SETTLE = 0.4  # discard the first 0.4s of bursty startup frames from the math
-    measure_window = max(0.3, wait_seconds - SETTLE)
-
-    settle_deadline = time.monotonic() + SETTLE
     collected: list = []
-    while time.monotonic() < settle_deadline:
-        remaining = settle_deadline - time.monotonic()
-        try:
-            chunk = q.get(timeout=min(0.2, max(0.05, remaining)))
-        except queue.Empty:
-            continue
-        collected.append(chunk)  # kept for the WAV, but NOT counted for the rate
 
-    measure_deadline = time.monotonic() + measure_window
-    measured_frames = 0
-    start = time.monotonic()
-    while time.monotonic() < measure_deadline:
-        remaining = measure_deadline - time.monotonic()
-        try:
-            chunk = q.get(timeout=min(0.2, max(0.05, remaining)))
-        except queue.Empty:
-            continue
-        measured_frames += chunk.shape[0]
-        collected.append(chunk)
-    elapsed = time.monotonic() - start
+    def _drain_settle() -> None:
+        """Collect (but don't count) the startup-settling frames."""
+        settle_deadline = time.monotonic() + SETTLE
+        while time.monotonic() < settle_deadline:
+            remaining = settle_deadline - time.monotonic()
+            try:
+                chunk = q.get(timeout=min(0.2, max(0.05, remaining)))
+            except queue.Empty:
+                continue
+            collected.append(chunk)
 
-    if measured_frames == 0 or elapsed <= 0:
-        return fallback, collected
-    measured = int(round(measured_frames / elapsed))
-    return _snap_to_common_rate(measured, fallback), collected
+    def _measure_once(window: float) -> int | None:
+        """Measure frames/elapsed over `window` seconds. None if nothing arrived."""
+        deadline = time.monotonic() + window
+        measured_frames = 0
+        start = time.monotonic()
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                chunk = q.get(timeout=min(0.2, max(0.05, remaining)))
+            except queue.Empty:
+                continue
+            measured_frames += chunk.shape[0]
+            collected.append(chunk)
+        elapsed = time.monotonic() - start
+        if measured_frames == 0 or elapsed <= 0:
+            return None
+        return int(round(measured_frames / elapsed))
+
+    # Initial settle + first measurement.
+    _drain_settle()
+    first_window = max(0.3, wait_seconds - SETTLE)
+    measured = _measure_once(first_window)
+
+    snapped = _snap_if_common(measured)
+    if snapped is not None:
+        return snapped, collected
+
+    # First measurement didn't snap (bursty startup, or nothing arrived). Re-measure
+    # over progressively longer windows; burstiness averages out. This is the fix
+    # for the 14097 Hz mic burst that previously fell back to a wrong 48000 Hz.
+    if measured is not None:
+        log.warning(
+            "true-rate measurement %d Hz not near any common rate; re-measuring "
+            "over a longer window (bursty startup).", measured,
+        )
+    for longer in (2.0, 3.0):
+        measured = _measure_once(longer)
+        snapped = _snap_if_common(measured)
+        if snapped is not None:
+            log.info("true-rate converged to %d Hz after longer window.", snapped)
+            return snapped, collected
+
+    # Genuinely can't pin it (silent source, or extreme jitter). Fall back to the
+    # REQUESTED rate for this source — never another source's rate. 16000 is a
+    # safe guess for the mic (matches Whisper's rate; worst case a 3x pitch
+    # error, never the multi-hour corruption a wrong 48k header causes).
+    if measured is not None:
+        import sys
+        print(f"WARN: true-rate measurement {measured} Hz stayed unreliable; "
+              f"falling back to {fallback} Hz.", file=sys.stderr, flush=True)
+    return fallback, collected
+
+
+def _snap_if_common(measured: int | None) -> int | None:
+    """Snap a measured rate to the nearest standard rate, or None if not near one.
+
+    Single source of truth for the tolerance decision: a measurement within
+    max(800, 5%) of a standard rate (48000/44100/32000/24000/22050/16000)
+    snaps to that rate; anything else returns None (untrustworthy). Returns the
+    SNAPPED standard rate, never the raw measurement, so the WAV header always
+    carries a clean standard rate.
+    """
+    if measured is None:
+        return None
+    common_rates = (48000, 44100, 32000, 24000, 22050, 16000)
+    snapped = min(common_rates, key=lambda c: abs(measured - c))
+    if abs(measured - snapped) <= max(800, snapped * 0.05):  # 5% tolerance
+        return snapped
+    return None
 
 
 def _snap_to_common_rate(measured: int, fallback: int) -> int:
@@ -414,13 +470,12 @@ def _snap_to_common_rate(measured: int, fallback: int) -> int:
     as unreliable (startup burstiness, silent source, scheduler jitter, etc.)
     and we return `fallback` rather than baking a nonsense rate into the WAV.
 
-    Pure function — extracted so the snapping/fallback decision can be tested
-    deterministically without depending on a background feeder thread's ability
-    to hold a steady cadence (which is unreliable on slow/loaded CI runners).
+    Pure function — kept for the deterministic unit tests of the snap decision.
+    Production code uses `_snap_if_common` (which returns None instead of a
+    fallback) so the caller can choose to re-measure rather than fall back.
     """
-    common_rates = (48000, 44100, 32000, 24000, 22050, 16000)
-    snapped = min(common_rates, key=lambda c: abs(measured - c))
-    if abs(measured - snapped) <= max(800, snapped * 0.05):  # 5% tolerance
+    snapped = _snap_if_common(measured)
+    if snapped is not None:
         return snapped
     # Measurement didn't match any common rate — don't trust it.
     import sys
@@ -450,6 +505,80 @@ def _create_mic_tap(callback, sample_rate: int, channels: int):
         sample_rate=float(sample_rate),
         channels=int(channels),
     )
+
+
+# ---- capture self-test (called from `rec setup`) --------------------------
+
+
+@dataclass
+class CaptureProbe:
+    """Result of probing one audio source for `seconds`.
+
+    `created` is False when the tap itself failed to construct (e.g. the mic is
+    denied, or macOS lacks the API). `peak` is the max absolute float sample
+    captured; near-zero on a live source means the permission isn't being
+    honored for the running app — the exact failure this tool exists to catch.
+    """
+    source: str        # "system" | "mic"
+    created: bool      # False if the tap raised at construction
+    error: str = ""    # message when created is False
+    peak: float = 0.0  # max |sample| over the probe window (0.0..1.0)
+    frames: int = 0    # total frames captured
+
+
+def probe_capture(source: str, seconds: float = 2.0) -> CaptureProbe:
+    """Open a tap for `seconds`, measure peak amplitude, then close it.
+
+    Used by `rec setup --selftest` to catch a broken capture permission BEFORE
+    a real meeting: macOS grants the Screen Recording checkbox but keeps
+    handing a running process zero buffers until the app is fully restarted.
+    A live tap that returns peak≈0 on a source that should have signal is the
+    signature of that state. The caller decides what counts as "signal" — for
+    the mic the user can speak; for system audio we ask them to play something.
+    """
+    import numpy as np
+
+    factory = _create_mic_tap if source == "mic" else _create_system_tap
+    collected: list[np.ndarray] = []
+
+    def _cb(samples_bytes: bytes, frame_count: int, n_channels: int, _host_time: int) -> None:
+        arr = np.frombuffer(samples_bytes, dtype=np.float32).copy()
+        collected.append(arr)
+
+    try:
+        tap = factory(_cb, 48000, 1)
+    except Exception as e:  # tap construction failed (denied / unsupported)
+        return CaptureProbe(source=source, created=False, error=str(e))
+
+    try:
+        tap.start()
+    except Exception as e:
+        try:
+            tap.destroy()
+        except Exception:
+            pass
+        return CaptureProbe(source=source, created=False, error=str(e))
+
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    try:
+        tap.stop()
+    finally:
+        try:
+            tap.destroy()
+        except Exception:
+            pass
+
+    if collected:
+        allv = np.concatenate(collected)
+        return CaptureProbe(
+            source=source, created=True,
+            peak=float(np.abs(allv).max(initial=0.0)),
+            frames=int(allv.size),
+        )
+    return CaptureProbe(source=source, created=True, peak=0.0, frames=0)
 
 
 def drain_with_timeout(q: queue.Queue, f, timeout_s: float) -> None:
