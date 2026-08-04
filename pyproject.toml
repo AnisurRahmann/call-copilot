@@ -2,8 +2,8 @@
 name = "call-copilot"
 version = "0.1.0"
 description = "Call Copilot — silently record meeting audio in the background, then transcribe locally to clean markdown."
-readme = "README.md"
-license = { text = "MIT" }
+readme = { file = "README.md", content-type = "text/markdown" }
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 authors = [
     { name = "Anisur Rahman", email = "pshakilwizard@gmail.com" },
@@ -22,6 +22,9 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
+# Runtime requirement: macOS 14.2+ (Core Audio process taps). pip can't enforce
+# an OS floor, so this is documented in the classifiers + checked at runtime by
+# `rec` itself (see src/rec/envcheck.py) with a clean, actionable message.
 dependencies = [
     "click>=8.1",
     "audiotap>=0.0.2",
@@ -36,6 +39,7 @@ dependencies = [
 Homepage = "https://github.com/AnisurRahmann/call-copilot"
 Repository = "https://github.com/AnisurRahmann/call-copilot"
 Issues = "https://github.com/AnisurRahmann/call-copilot/issues"
+Changelog = "https://github.com/AnisurRahmann/call-copilot/releases"
 
 [project.optional-dependencies]
 dev = [

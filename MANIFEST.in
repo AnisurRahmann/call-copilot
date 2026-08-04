@@ -1,0 +1,11 @@
+# Include docs + metadata in the source distribution (sdist). The wheel only
+# needs the Python package under src/; the sdist also carries README, LICENSE,
+# the Homebrew formula, and the release docs so the package is self-describing.
+include README.md
+include LICENSE
+include CONTRIBUTING.md
+include SECURITY.md
+include CODE_OF_CONDUCT.md
+include Makefile
+recursive-include docs *.md
+recursive-include .github *.yml

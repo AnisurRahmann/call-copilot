@@ -26,7 +26,7 @@ import rich.box
 from rich.console import Console
 from rich.table import Table
 
-from . import __version__, audio_check, config, formatter, recorder, session, transcriber
+from . import __version__, audio_check, config, envcheck, formatter, recorder, session, transcriber
 from . import log as log_mod
 
 console = Console()
@@ -54,6 +54,12 @@ def logging_level_name(level: int) -> str:
 @click.pass_context
 def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
     """Call Copilot — silently record meeting audio, then transcribe locally to markdown."""
+    # Fail fast before any real work if this machine can't record. Click
+    # processes --version/--help during option parsing and never calls this
+    # callback, so they still work on unsupported systems (handy for "what
+    # version is this broken install?"). cli.main() catches the ClickException
+    # and prints a clean one-line error with exit code 1 — no traceback.
+    envcheck.check_runtime()
     _setup_logging_for_run(verbose, quiet, ctx.invoked_subcommand)
 
 
