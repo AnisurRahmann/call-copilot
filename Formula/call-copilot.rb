@@ -33,8 +33,8 @@ class CallCopilot < Formula
   # The sdist is used only as the formula's downloadable + hash-verified source
   # (so Homebrew can version + audit it). The actual install is by name (below),
   # which lets pip resolve the complete dependency tree from PyPI.
-  url "https://files.pythonhosted.org/packages/37/7c/e0279aeb30848b1a1d8e597057b1e3a5c0d9756df75df0fedd97fbed7485/call_copilot-0.2.0.tar.gz"
-  sha256 "1ac19cc343bde708b60c19334ff5b223a7c975853bffe7e17843d110f8419c52"
+  url "https://files.pythonhosted.org/packages/aa/30/e4218e84b31e87e12d76e2b7353f6a5889bc17e72b86f1542e25ba048632/call_copilot-0.3.0.tar.gz"
+  sha256 "d9f71f4ce4efe8072e1214bfd5877651610975de636d870549776293191b9500"
   license "MIT"
   head "https://github.com/AnisurRahmann/call-copilot.git", branch: "main"
 
