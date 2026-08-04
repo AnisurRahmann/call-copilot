@@ -95,6 +95,65 @@ def test_setup_success_saves_config(monkeypatch, xdg):
     assert cfg.sample_rate == 16000
 
 
+def test_setup_selftest_can_be_skipped(monkeypatch, xdg):
+    """--no-selftest short-circuits the live tap probe (for CI / automation)."""
+    monkeypatch.setattr(cli.platform, "mac_ver", lambda: ("14.4.0", "", ""))
+    probe_calls: list = []
+    monkeypatch.setattr(
+        recorder, "probe_capture",
+        lambda src, seconds: probe_calls.append((src, seconds)) or None,
+    )
+    res = CliRunner().invoke(cli.cli, ["setup", "--no-selftest"])
+    assert res.exit_code == 0, res.output
+    assert "skipped" in res.output.lower()
+    assert probe_calls == []  # probe never ran
+
+
+def test_setup_selftest_reports_silent_source_as_failure(monkeypatch, xdg):
+    """A tap that returns near-zero peak is flagged FAIL with restart guidance."""
+    from rec.recorder import CaptureProbe
+    monkeypatch.setattr(cli.platform, "mac_ver", lambda: ("14.4.0", "", ""))
+    # Default capture is mic+system; both probes return silence.
+    monkeypatch.setattr(
+        recorder, "probe_capture",
+        lambda src, seconds: CaptureProbe(source=src, created=True, peak=0.0, frames=1000),
+    )
+    res = CliRunner().invoke(cli.cli, ["setup", "--selftest-duration", "1"])
+    assert res.exit_code == 0, res.output
+    assert "FAIL" in res.output
+    assert "QUIT" in res.output and "reopen" in res.output
+    assert "incomplete" in res.output.lower()
+
+
+def test_setup_selftest_reports_healthy_source_as_ok(monkeypatch, xdg):
+    """A tap that captures real audio reports ok and setup completes."""
+    from rec.recorder import CaptureProbe
+    monkeypatch.setattr(cli.platform, "mac_ver", lambda: ("14.4.0", "", ""))
+    monkeypatch.setattr(
+        recorder, "probe_capture",
+        lambda src, seconds: CaptureProbe(source=src, created=True, peak=0.4, frames=5000),
+    )
+    res = CliRunner().invoke(cli.cli, ["setup", "--selftest-duration", "1"])
+    assert res.exit_code == 0, res.output
+    assert "[ok]" in res.output
+    assert "Setup complete" in res.output
+    assert "incomplete" not in res.output.lower()
+
+
+def test_setup_selftest_reports_tap_creation_failure(monkeypatch, xdg):
+    """If a tap can't be constructed (e.g. denied), it's a FAIL, not a crash."""
+    from rec.recorder import CaptureProbe
+    monkeypatch.setattr(cli.platform, "mac_ver", lambda: ("14.4.0", "", ""))
+    monkeypatch.setattr(
+        recorder, "probe_capture",
+        lambda src, seconds: CaptureProbe(source=src, created=False, error="permission denied"),
+    )
+    res = CliRunner().invoke(cli.cli, ["setup", "--selftest-duration", "1"])
+    assert res.exit_code == 0, res.output
+    assert "FAIL" in res.output
+    assert "permission denied" in res.output
+
+
 # ---- start -----------------------------------------------------------------
 
 
@@ -199,6 +258,41 @@ def test_start_reports_spawn_failure(monkeypatch, cfg_written):
     assert "Failed to start recording" in res.output
 
 
+def test_start_warns_when_mic_permission_missing(monkeypatch, cfg_written):
+    """When capture includes the mic but permission isn't GRANTED, warn at start."""
+    monkeypatch.setattr(recorder, "active_pid", lambda: None)
+    monkeypatch.setattr(recorder, "spawn_recorder", lambda sid, sr, ch, cap: 12345)
+    # Simulate mic permission NOT granted.
+    monkeypatch.setattr(cli, "_mic_permission_granted", lambda: False)
+
+    res = CliRunner().invoke(cli.cli, ["start", "--detach"])
+    assert res.exit_code == 0, res.output
+    assert "Microphone permission is not granted" in res.output
+    assert "SKIPPED" in res.output
+
+
+def test_start_no_mic_warning_when_system_only(monkeypatch, cfg_written):
+    """--system-only never triggers the mic-permission warning."""
+    monkeypatch.setattr(recorder, "active_pid", lambda: None)
+    monkeypatch.setattr(recorder, "spawn_recorder", lambda sid, sr, ch, cap: 12345)
+    monkeypatch.setattr(cli, "_mic_permission_granted", lambda: False)
+
+    res = CliRunner().invoke(cli.cli, ["start", "--detach", "--system-only"])
+    assert res.exit_code == 0, res.output
+    assert "Microphone permission is not granted" not in res.output
+
+
+def test_start_no_mic_warning_when_permission_granted(monkeypatch, cfg_written):
+    """Default mic+system capture with permission granted -> no warning."""
+    monkeypatch.setattr(recorder, "active_pid", lambda: None)
+    monkeypatch.setattr(recorder, "spawn_recorder", lambda sid, sr, ch, cap: 12345)
+    monkeypatch.setattr(cli, "_mic_permission_granted", lambda: True)
+
+    res = CliRunner().invoke(cli.cli, ["start", "--detach"])
+    assert res.exit_code == 0, res.output
+    assert "Microphone permission is not granted" not in res.output
+
+
 # ---- stop ------------------------------------------------------------------
 
 
@@ -247,6 +341,7 @@ def test_stop_merges_mic_plus_system_transcript(monkeypatch, cfg_written, fake_t
 
 
 def test_stop_warns_on_silent_recording(monkeypatch, cfg_written, fake_transcribe):
+    """A silent recording is flagged, NOT transcribed (Whisper hallucinates on silence)."""
     from rec.audio_check import AudioLevels
     monkeypatch.setattr(
         cli.audio_check,
@@ -266,6 +361,86 @@ def test_stop_warns_on_silent_recording(monkeypatch, cfg_written, fake_transcrib
     assert res.exit_code == 0, res.output
     assert "silent" in res.output.lower()
     assert session.load_meta(sid).extra.get("audio_silent") is True
+    # NEW: transcription is skipped on silence, session marked SILENT.
+    assert session.load_meta(sid).status == session.STATUS_SILENT
+    assert session.load_meta(sid).word_count == 0
+    # Whisper was never called.
+    assert "wav" not in fake_transcribe
+    assert "Skipping transcription" in res.output
+    assert not session.transcript_path(sid).exists()
+
+
+def test_stop_transcribes_when_system_silent_but_mic_has_audio(monkeypatch, cfg_written, fake_transcribe):
+    """mic+system: if the mic captured audio, transcribe it even if system was silent."""
+    from rec.audio_check import AudioLevels
+
+    # System WAV is silent, mic WAV is healthy. analyze_wav returns based on path.
+    def fake_analyze(wav):
+        if "recording-mic" in str(wav):
+            return AudioLevels(peak=0.5, rms=0.1, frames=16000 * 25, sample_rate=16000, silent=False)
+        return AudioLevels(peak=0.0, rms=0.0, frames=16000 * 25, sample_rate=16000, silent=True)
+
+    monkeypatch.setattr(cli.audio_check, "analyze_wav", fake_analyze)
+
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_RECORDING)
+    session.create_session_dir(sid)
+    session.wav_path(sid).write_bytes(b"silent system")
+    session.mic_wav_path(sid).write_bytes(b"good mic")
+
+    monkeypatch.setattr(recorder, "active_pid", lambda: 4321)
+    monkeypatch.setattr(recorder, "stop_recorder", lambda: (True, 4321))
+
+    res = CliRunner().invoke(cli.cli, ["stop"])
+    assert res.exit_code == 0, res.output
+    # Transcription ran (mic had audio) — session is TRANSCRIBED, not SILENT.
+    assert session.load_meta(sid).status == session.STATUS_TRANSCRIBED
+    assert "Transcript:" in res.output
+
+
+def test_stop_skips_when_both_mic_and_system_silent(monkeypatch, cfg_written, fake_transcribe):
+    """mic+system where BOTH sources are silent -> skip transcription, mark SILENT."""
+    from rec.audio_check import AudioLevels
+    monkeypatch.setattr(
+        cli.audio_check,
+        "analyze_wav",
+        lambda wav: AudioLevels(peak=0.0, rms=0.0, frames=16000 * 25, sample_rate=16000, silent=True),
+    )
+
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_RECORDING)
+    session.create_session_dir(sid)
+    session.wav_path(sid).write_bytes(b"silent system")
+    session.mic_wav_path(sid).write_bytes(b"silent mic")
+
+    monkeypatch.setattr(recorder, "active_pid", lambda: 4321)
+    monkeypatch.setattr(recorder, "stop_recorder", lambda: (True, 4321))
+
+    res = CliRunner().invoke(cli.cli, ["stop"])
+    assert res.exit_code == 0, res.output
+    assert session.load_meta(sid).status == session.STATUS_SILENT
+    assert "wav" not in fake_transcribe  # Whisper not called
+
+
+def test_stop_silent_warning_mentions_quit_and_reopen(monkeypatch, cfg_written, fake_transcribe):
+    """The zero-frames silence warning must name Screen Recording + quit/reopen."""
+    from rec.audio_check import AudioLevels
+    monkeypatch.setattr(
+        cli.audio_check,
+        "analyze_wav",
+        lambda wav: AudioLevels(peak=0.0, rms=0.0, frames=16000 * 25, sample_rate=16000, silent=True),
+    )
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_RECORDING)
+    session.create_session_dir(sid)
+    session.wav_path(sid).write_bytes(b"silent")
+    monkeypatch.setattr(recorder, "active_pid", lambda: 4321)
+    monkeypatch.setattr(recorder, "stop_recorder", lambda: (True, 4321))
+
+    res = CliRunner().invoke(cli.cli, ["stop"])
+    out = res.output.lower()
+    assert "quit" in out and "reopen" in out
+    assert "screen recording" in out
 
 
 def test_stop_salvages_when_recorder_already_dead(monkeypatch, cfg_written, fake_transcribe, fake_audio_levels):

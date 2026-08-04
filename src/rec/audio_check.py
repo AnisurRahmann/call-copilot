@@ -83,14 +83,32 @@ def analyze_wav(wav_path: str | Path) -> AudioLevels | None:
     levels = AudioLevels(peak=peak, rms=rms, frames=total, sample_rate=sr, silent=silent)
 
     if silent:
-        log.error(
-            "RECORDING IS SILENT: peak=%.6f rms=%.6f over %.1fs — "
-            "the audio tap captured no signal. Either nothing was playing, "
-            "or macOS revoked the system-audio capture permission. "
-            "Run `rec setup` to re-check permissions, then record again while "
-            "audio is actually playing.",
-            peak, rms, levels.duration_seconds,
-        )
+        # Distinguish the two causes of silence. A tap that ran (frames > 0)
+        # but produced *literal* zeros (peak exactly 0.0) almost always means
+        # macOS is not honoring the capture permission for the running app:
+        # the tap is invoked with real frame counts but every sample is 0.
+        # A genuinely quiet-but-live source usually leaves some dither noise
+        # (peak > 0 but < threshold). Tailor the guidance accordingly.
+        if total > 0 and peak == 0.0:
+            log.error(
+                "RECORDING IS SILENT: peak=%.6f rms=%.6f over %.1fs (%d frames). "
+                "The tap ran but captured literally zero samples — this is the "
+                "macOS capture-permission signature, not a quiet source. Toggle "
+                "Screen Recording ON for your terminal app in System Settings > "
+                "Privacy & Security, then FULLY QUIT and reopen the app (a running "
+                "process keeps getting zero buffers until restarted). Re-check with "
+                "`rec setup`.",
+                peak, rms, levels.duration_seconds, total,
+            )
+        else:
+            log.error(
+                "RECORDING IS SILENT: peak=%.6f rms=%.6f over %.1fs — "
+                "the audio tap captured no usable signal. Either nothing was "
+                "playing, or macOS revoked the system-audio capture permission. "
+                "Run `rec setup` to re-check permissions, then record again while "
+                "audio is actually playing.",
+                peak, rms, levels.duration_seconds,
+            )
     else:
         log.info("audio levels OK: peak=%.4f rms=%.4f over %.1fs", peak, rms, levels.duration_seconds)
     return levels
