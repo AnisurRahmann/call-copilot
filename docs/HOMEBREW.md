@@ -74,14 +74,10 @@ on a `v*` tag. After it succeeds:
 4. Commit + push to `homebrew-tap`. Existing users get the update on
    `brew upgrade`.
 
-> ⏱️ **The ~24h freshness guard.** Homebrew's `virtualenv_create` adds
-> `--uploaded-prior-to=P1D` to its pip calls — a supply-chain safety measure
-> that refuses PyPI packages published less than ~24 hours ago. So a brand-new
-> release will fail `brew install` with
-> `No matching distribution found for call-copilot` until ~24h have passed
-> since the PyPI upload. This is intentional Homebrew behaviour, not a bug in
-> the formula. Until the guard lapses, `pipx install call-copilot` works
-> immediately (pipx has no such guard).
+> `brew install` works **immediately** on release day — the formula creates the
+> venv and calls `pip install` directly (see "How the formula works" below),
+> which resolves the full dependency tree from PyPI and is not subject to
+> Homebrew's `--uploaded-prior-to=P1D` freshness guard.
 
 ## How the formula works
 
@@ -89,13 +85,15 @@ on a `v*` tag. After it succeeds:
   macOS-only, as is the API it wraps. There's no point offering this on Linux.
 - **`depends_on "python@3.12"`** — pins a Python the formula controls, so the
   user's system Python version doesn't matter.
-- **`virtualenv_create` + `pip_install_and_link "call-copilot==<version>"`** —
-  installs the package **by name**, letting pip resolve the full dependency
-  tree (audiotap, faster-whisper, rich, click, numpy, …) from PyPI into an
-  isolated virtualenv under `libexec`, then links `rec` onto `PATH`. This
-  avoids enumerating every transitive dep as a separate Homebrew `resource`.
-  The sdist `url`/`sha256` at the top are Homebrew's auditable source record;
-  the actual install fetches the wheel from PyPI.
+- **Direct `python -m venv` + `pip install` (not Homebrew's wrapper)** — the
+  formula deliberately avoids `Language::Python::Virtualenv`'s
+  `virtualenv_create` / `venv.pip_install` helpers, because they inject
+  `--no-deps` (which would skip the dependency tree → `rec` crashes with
+  `No module named 'click'`) and `--uploaded-prior-to=P1D` (which refuses a
+  package published <24h ago). Calling pip directly resolves the full tree
+  (audiotap, faster-whisper, rich, click, numpy, …) from PyPI and works on
+  release day. The sdist `url`/`sha256` at the top are Homebrew's auditable
+  source record; the actual install fetches the wheel from PyPI.
 - **`test do`** — runs `rec --version` (which bypasses the macOS-version gate,
   so it passes in Homebrew's CI without an audio device) and checks the version
   string matches.
@@ -104,7 +102,7 @@ on a `v*` tag. After it succeeds:
 
 | Symptom | Fix |
 |---|---|
-| `No matching distribution found for call-copilot` | The release is <24h old — Homebrew's freshness guard. Wait ~24h after the PyPI upload, or use `pipx install call-copilot` in the meantime. |
+| `Failed to fix install linkage` warning for `libaudiotap.dylib` | Harmless — audiotap's prebuilt dylib has no room in its mach-o header for Homebrew's dylib-ID rewrite, but it loads fine via `@rpath`. `rec` works normally; ignore the warning. |
 | `brew install` says checksum mismatch | The `sha256` in the formula doesn't match the sdist on PyPI. Recompute it (see above) and push to `homebrew-tap`. |
 | `Error: call-copilot: no bottle` | Not an error — this is a source build from PyPI. The first `brew install` pulls prebuilt macOS wheels for `faster-whisper`/`numpy`; subsequent upgrades are fast. |
 | `rec` not found after install | Run `brew link call-copilot` or check `brew --prefix call-copilot/bin`. |
