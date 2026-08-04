@@ -611,4 +611,7 @@ def test_help_lists_all_commands():
 def test_version():
     res = CliRunner().invoke(cli.cli, ["--version"])
     assert res.exit_code == 0
-    assert "0.1.0" in res.output
+    # Match the version string declared in the package, so this test doesn't
+    # break every time we bump the version.
+    from rec import __version__
+    assert __version__ in res.output

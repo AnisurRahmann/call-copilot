@@ -18,10 +18,13 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-# The OIDC token needs these permissions to be issued by GitHub.
+# The OIDC token needs id-token:write to be issued by GitHub, and contents:write
+# so the "Create GitHub Release" step can publish the release + assets. A bare
+# contents:read (the previous value) made PyPI publish succeed but the GitHub
+# Release step fail with a 403 "Resource not accessible by integration".
 permissions:
   id-token: write
-  contents: read
+  contents: write
 
 jobs:
   build:
