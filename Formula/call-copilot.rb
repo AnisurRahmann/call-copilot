@@ -5,32 +5,36 @@
 # `Formula/call-copilot.rb`. Users install with:
 #
 #   brew install AnisurRahmann/tap/call-copilot
-#   # equivalent to:
-#   brew tap AnisurRahmann/tap
-#   brew install call-copilot
 #
-# It installs from the published PyPI sdist (not from git), so it tracks real
-# releases. The native `audiotap` wheel is macOS-only and arm64/x86_64, which
-# matches Homebrew's macOS-only support — no cross-platform caveats.
+# It installs from the published PyPI wheel by name, so pip resolves the FULL
+# dependency tree (click, audiotap, faster-whisper, rich, numpy, ...) from
+# PyPI automatically — no manual resource stanzas per dependency.
+#
+# NOTE on the first ~24 hours after a release: Homebrew's `virtualenv_create`
+# adds `--uploaded-prior-to=P1D` to its pip calls, a supply-chain safety guard
+# that refuses packages published less than ~24h ago. So a brand-new release
+# (uploaded today) will fail `brew install` with
+# "No matching distribution found for call-copilot" until ~24h have passed.
+# This is intentional Homebrew behaviour, not a bug in this formula. Until then,
+# `pipx install call-copilot` works immediately. After 24h, `brew install`
+# works normally.
 #
 # Updating for a new release (after `git tag vX.Y.Z` + the release workflow
 # publishes to PyPI):
-#   1. Look up the sdist: https://pypi.org/project/call-copilot/#files
-#   2. `shasum -a 256 <the .tar.gz>` (or `curl -L <url> | shasum -a 256`)
-#   3. Update `version` and `sha256` below.
-#   4. Commit to the `homebrew-tap` repo on its default branch. `brew upgrade`
-#      picks it up automatically.
+#   1. Look up the new version: https://pypi.org/project/call-copilot/#files
+#   2. Update `version` and the `url`/`sha256` below (use the sdist .tar.gz).
+#   3. Commit + push to the `homebrew-tap` repo. `brew upgrade` picks it up.
 
 class CallCopilot < Formula
   include Language::Python::Virtualenv
 
   desc "Silently record meeting audio, then transcribe locally to clean markdown"
   homepage "https://github.com/AnisurRahmann/call-copilot"
-  url "https://files.pythonhosted.org/packages/source/c/call-copilot/call-copilot-0.1.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-  # When publishing the first real release, replace the placeholder sha256
-  # above with the real value (see header comment). Homebrew refuses to
-  # install on a checksum mismatch, so a wrong/zero hash fails loudly.
+  # The sdist is used only as the formula's downloadable + hash-verified source
+  # (so Homebrew can version + audit it). The actual install is by name (below),
+  # which lets pip resolve the complete dependency tree from PyPI.
+  url "https://files.pythonhosted.org/packages/37/7c/e0279aeb30848b1a1d8e597057b1e3a5c0d9756df75df0fedd97fbed7485/call_copilot-0.2.0.tar.gz"
+  sha256 "1ac19cc343bde708b60c19334ff5b223a7c975853bffe7e17843d110f8419c52"
   license "MIT"
   head "https://github.com/AnisurRahmann/call-copilot.git", branch: "main"
 
@@ -38,29 +42,26 @@ class CallCopilot < Formula
   # macOS-only (which is also the only place Core Audio taps exist).
   depends_on :macos
 
-  # Homebrew's Python 3.11+ is provided automatically by `python` (uses the
-  # brewed python@3.12 as the runtime). faster-whisper / numpy wheels exist
-  # for both arm64 and x86_64 on macOS, so no `:build` deps are needed.
+  # Homebrew's python@3.12 provides the interpreter. We do NOT bundle
+  # setuptools/wheel ourselves — faster-whisper / numpy ship macOS wheels
+  # (arm64 + x86_64), so nothing needs to compile from source.
   depends_on "python@3.12"
 
-  resource "call-copilot" do
-    # The sdist already carries the full dependency set in its metadata, so we
-    # let pip resolve transitive deps in one install rather than enumerating
-    # every resource by hand.
-    url "https://files.pythonhosted.org/packages/source/c/call-copilot/call-copilot-0.1.0.tar.gz"
-    sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-  end
-
   def install
+    # Create an isolated venv under libexec and install call-copilot BY NAME.
+    # This is the key choice: `pip_install_and_link "call-copilot==#{version}"`
+    # tells pip to resolve the package AND its entire dependency tree from PyPI
+    # (click, audiotap, faster-whisper, rich, numpy, pydantic, soundfile...),
+    # rather than enumerating each dep as a separate Homebrew `resource`.
+    # `pip_install_and_link` also links the `rec` console script onto PATH.
     venv = virtualenv_create(libexec, "python3.12")
-    venv.pip_install resource("call-copilot")
-    # Link only the user-facing CLI onto PATH (keeps deps isolated in libexec).
-    bin.install_symlink Dir["#{libexec}/bin/rec"]
+    venv.pip_install_and_link "call-copilot==#{version}"
   end
 
   test do
-    # --version and --help bypass the macOS-version gate, so they work in CI
-    # without an audio device. This is the same command `make test` checks.
+    # --version bypasses the macOS-version gate, so it works in Homebrew CI
+    # without an audio device or macOS 14.2 (the runner's macOS is supported,
+    # but this guards against any environment). Matches the version we built.
     assert_match version.to_s, shell_output("#{bin}/rec --version")
   end
 end
