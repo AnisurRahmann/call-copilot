@@ -59,10 +59,34 @@ recording.wav ──> faster-whisper (local, free) ──> transcript.md
 
 ## Requirements
 
-- **macOS 14.2 or later** (Core Audio process taps API). Apple Silicon recommended.
-- Python 3.11+.
+- **macOS 14.2 or later** (Sonoma — the Core Audio process taps API `rec` records through
+  landed in 14.2). Apple Silicon recommended. Intel works.
+- **Python 3.11+** only needed for the `pipx` install; the Homebrew formula brings its own.
 
-No Homebrew packages, no audio drivers, no manual Audio MIDI Setup. Just `pip install`.
+No virtual audio driver (no BlackHole), no Multi-Output Device, no manual Audio MIDI Setup.
+The tap reads system output directly. `rec` checks the macOS version itself and refuses to
+run below 14.2 with a one-line message — you don't have to guess.
+
+## Install
+
+**Homebrew** (recommended — no Python to manage):
+
+```bash
+brew install AnisurRahmann/tap/call-copilot
+```
+
+**pipx** (if you prefer a plain Python install, no Homebrew):
+
+```bash
+pipx install call-copilot
+```
+
+Either way you get a `rec` command on your `PATH`. Then jump to
+[One-time setup](#one-time-setup).
+
+> Using `rec` on a machine below macOS 14.2 prints `Error: rec requires macOS 14.2 or
+> later ...` and exits — no traceback, no mystery. See
+> [docs/HOMEBREW.md](docs/HOMEBREW.md) if you're setting up the tap yourself.
 
 ## Recording consent & privacy
 
@@ -78,13 +102,6 @@ On the technical side, your data stays put:
   first run of a given Whisper model, which downloads its weights from Hugging Face;
   after that it's fully offline.
 - Recordings live under `~/.local/share/rec/sessions/` (XDG data home), outside any repo.
-
-## Install
-
-```bash
-git clone https://github.com/AnisurRahmann/call-copilot.git && cd call-copilot
-make install          # creates .venv and installs `rec`
-```
 
 ## One-time setup
 
@@ -222,12 +239,19 @@ by a debugging checklist. (`rec diagnose` accepts a unique prefix too, e.g. `202
 
 ## Development
 
+You only need this if you're hacking on `rec` itself. End users should use the
+[Install](#install) commands above.
+
 ```bash
-make test            # unit tests (89, offline — no audio device or model download needed)
+git clone https://github.com/AnisurRahmann/call-copilot.git && cd call-copilot
+make install          # creates .venv and installs `rec` in editable mode + dev deps
+make test             # unit tests (offline — no audio device or model download needed)
+make run              # rec start, using the dev venv's rec
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, code style, and pull-request
-expectations.
+`make install` requires Python 3.11+ on your `PATH` (it pins `python3.11` for the
+venv). For everything else — releasing, the Homebrew tap, code style — see
+[CONTRIBUTING.md](CONTRIBUTING.md) and [docs/HOMEBREW.md](docs/HOMEBREW.md).
 
 ## Contributing
 

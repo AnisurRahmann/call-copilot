@@ -1,4 +1,4 @@
-.PHONY: install test run run-verbose list status logs diagnose clean help
+.PHONY: install test build run run-verbose list status logs diagnose clean help
 
 PYTHON := .venv/bin/python
 PIP    := .venv/bin/pip
@@ -8,6 +8,7 @@ help:
 	@echo "rec — meeting recorder"
 	@echo "  make install       create venv + install dev deps"
 	@echo "  make test          run unit tests"
+	@echo "  make build         build sdist + wheel into dist/ (for release)"
 	@echo "  make run           rec start"
 	@echo "  make run-verbose   rec -v start (INFO logs on stderr)"
 	@echo "  make list          rec list"
@@ -25,6 +26,12 @@ install: .venv
 
 test:
 	$(PYTHON) -m pytest tests -v
+
+# Build the publishable sdist + wheel. `build` is a dev-only tool (not a
+# runtime dependency), so install it here if the editable env lacks it.
+build:
+	$(PIP) install --quiet build >/dev/null
+	$(PYTHON) -m build
 
 run:
 	$(REC) start
