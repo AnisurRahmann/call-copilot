@@ -27,6 +27,11 @@ TRANSCRIPT_FILENAME = "transcript.md"
 STATUS_RECORDING = "recording"
 STATUS_RECORDED = "recorded"
 STATUS_TRANSCRIBED = "transcribed"
+# A SILENT session captured only zero samples — nothing to transcribe.
+# Whisper on pure silence hallucinates text (e.g. a repeated "You"), so we
+# skip transcription entirely and mark the session SILENT instead. The WAV
+# stays on disk for `rec diagnose` to inspect.
+STATUS_SILENT = "silent"
 
 
 def new_session_id(now: datetime | None = None) -> str:

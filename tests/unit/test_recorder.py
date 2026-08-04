@@ -368,3 +368,143 @@ def test_mic_denied_falls_back_to_system_only(xdg, fake_audiotap_mic_denied):
     assert not session.mic_wav_path(sid).exists()
     assert _FakeTap._created.get("mic", []) == []
     assert len(_FakeTap._created.get("system", [])) == 1
+
+
+# ---- probe_capture (the setup self-test) -----------------------------------
+
+
+def test_probe_capture_measures_peak_from_feed(fake_audiotap):
+    """probe_capture opens the tap, collects fed audio, reports the peak."""
+    import threading
+    _FakeTap._created = {}
+
+    def feed_after_start():
+        # Wait for the system tap to start, then feed it 0.5-amplitude audio.
+        for _ in range(100):
+            taps = _FakeTap._created.get("system", [])
+            if taps and taps[0].started:
+                break
+            time.sleep(0.005)
+        for _ in range(5):
+            _FakeTap._created["system"][0].feed(1000)
+            time.sleep(0.005)
+
+    threading.Thread(target=feed_after_start, daemon=True).start()
+    probe = recorder.probe_capture("system", seconds=0.5)
+    assert probe.created is True
+    # The fake feed delivers float32 samples at amplitude 0.5.
+    assert probe.peak == 0.5
+    assert probe.frames > 0
+
+
+def test_probe_capture_reports_silence_when_nothing_feeds(fake_audiotap):
+    """A tap that starts but receives no audio reports peak=0.0 (the bug signature)."""
+    _FakeTap._created = {}
+    probe = recorder.probe_capture("system", seconds=0.3)
+    assert probe.created is True
+    assert probe.peak == 0.0
+    assert probe.frames == 0
+
+
+def test_probe_capture_reports_construction_failure(monkeypatch):
+    """If the tap factory raises, probe_capture returns created=False with the error."""
+    def boom(callback, sample_rate, channels):
+        raise RuntimeError("no input device")
+    monkeypatch.setattr(recorder, "_create_system_tap", boom)
+    probe = recorder.probe_capture("system", seconds=0.2)
+    assert probe.created is False
+    assert "no input device" in probe.error
+
+
+# ---- mic bursty-startup rate detection (the 2026-08-04 chipmunk bug) -------
+
+
+def test_measure_true_rate_remeasures_bursty_startup():
+    """A bursty startup measurement must NOT fall back to a wrong rate.
+
+    Reproduces session 2026-08-04_17-19-38: the mic tap delivered at a true
+    16000 Hz, but a bursty 1-second startup window measured ~14000 Hz (rejected
+    by the snap guard). The old code then fell back to the SYSTEM tap's 48000 Hz
+    (borrowed as the mic's fallback) and wrote a 48000 header over 16000-data ->
+    3x-too-fast (chipmunk) playback. The fix re-measures over a longer window,
+    which converges on the true 16000 Hz. All chunks are kept (no audio lost).
+    """
+    import queue
+    import threading
+
+    import numpy as np
+
+    q: queue.Queue = queue.Queue()
+
+    def feeder():
+        # Let the 0.4s settle window pass, then deliver a burst that makes the
+        # first ~0.6s measurement window read well under 16000 (rejected).
+        time.sleep(0.45)
+        for _ in range(8):
+            q.put(np.ones(1050, dtype=np.float32) * 0.1)
+            time.sleep(0.005)
+        time.sleep(0.6)
+        # Now deliver steadily at the TRUE 16000 Hz for the re-measure windows.
+        end = time.monotonic() + 5.0
+        while time.monotonic() < end:
+            q.put(np.ones(1600, dtype=np.float32) * 0.1)
+            time.sleep(0.1)
+
+    threading.Thread(target=feeder, daemon=True).start()
+    # fallback is 16000 (the requested rate), NOT another source's 48000.
+    rate, chunks = recorder._measure_true_rate(q, fallback=16000, wait_seconds=1.0)
+    assert rate == 16000, f"expected re-measure to converge on 16000, got {rate}"
+    assert len(chunks) > 0  # audio was collected throughout (no loss)
+
+
+def test_measure_true_rate_falls_back_only_after_remeasure_fails(xdg):
+    """If the source stays bursty/jittery across all windows, fall back to requested rate."""
+    import queue
+    import threading
+
+    import numpy as np
+
+    q: queue.Queue = queue.Queue()
+
+    def feeder():
+        # Deliver at a non-standard rate that never snaps (e.g. 7777 Hz-ish jitter).
+        end = time.monotonic() + 8.0
+        while time.monotonic() < end:
+            q.put(np.ones(700, dtype=np.float32) * 0.1)
+            time.sleep(0.09)  # ~7777 Hz, not near any common rate
+
+    threading.Thread(target=feeder, daemon=True).start()
+    rate, _ = recorder._measure_true_rate(q, fallback=16000, wait_seconds=1.0)
+    assert rate == 16000  # never snapped -> requested-rate fallback (NOT 48000)
+
+
+def test_snap_if_common_returns_snapped_standard_rate():
+    """_snap_if_common returns the clean standard rate, never the raw measurement."""
+    assert recorder._snap_if_common(15800) == 16000
+    assert recorder._snap_if_common(47800) == 48000
+    assert recorder._snap_if_common(14097) is None  # the bug's burst value
+    assert recorder._snap_if_common(11840) is None   # the older 4x-slow burst
+    assert recorder._snap_if_common(None) is None
+
+
+def test_daemon_mic_wav_header_is_not_borrowed_from_system(xdg, fake_audiotap):
+    """The mic WAV rate must be measured for the mic, never copied from system.
+
+    Regression for the chipmunk bug: when both taps run, the mic's header rate
+    was set to the system tap's 48000. With the fix, each source's rate is
+    measured independently (here the fake feeds both at 1600 frames/0.1s =>
+    16000 Hz, matching the requested rate).
+    """
+    sid = "2026-08-04_17-19-38"
+    session.create_session_dir(sid)
+
+    code, _ = _run_daemon_with_feeder(sid, 16000, 1, capture="mic+system",
+                                      feed_frames_per_call=1600, feed_count=10)
+    assert code == 0
+    import soundfile as sf
+
+    # The mic WAV must carry the requested 16000 Hz header, not 48000.
+    with sf.SoundFile(str(session.mic_wav_path(sid))) as f:
+        assert f.samplerate == 16000, f"mic header is {f.samplerate}, expected 16000"
+    with sf.SoundFile(str(session.wav_path(sid))) as f:
+        assert f.samplerate == 16000
