@@ -24,6 +24,7 @@ from datetime import datetime
 import click
 import rich.box
 from rich.console import Console
+from rich.status import Status
 from rich.table import Table
 
 from . import __version__, audio_check, config, envcheck, formatter, recorder, session, transcriber
@@ -381,9 +382,16 @@ def _run_live_recording(
         # The daemon died on its own (crash / system sleep). Salvage what we have.
         console.print("\n[yellow](recorder exited unexpectedly — salvaging partial audio.)[/]")
 
-    # Stop the daemon (no-op if already dead) and run silence-check + transcribe.
-    recorder.stop_recorder()
-    _finish_session(cfg, session_id, model_override=model_override, vad_filter=vad_filter)
+    # Stop the daemon FIRST (no-op if already dead): it drains + closes the WAV
+    # under SIGTERM. The daemon runs in its own session (start_new_session=True),
+    # so Ctrl+C did NOT propagate to it — without this call it would keep
+    # recording as an orphan and _finish_session would read a half-written file.
+    # Then run the silence-check + transcription. Both can take a few seconds,
+    # so each shows a spinner so the user knows the process is working.
+    _stop_recorder_with_status()
+    _finish_session_with_status(
+        cfg, session_id, model_override=model_override, vad_filter=vad_filter
+    )
 
 
 # ---- stop ------------------------------------------------------------------
@@ -410,11 +418,46 @@ def stop(model: str | None, vad: bool) -> None:
     if session_id is None:
         raise click.ClickException("No active recording to stop.")
 
-    was_alive, _ = recorder.stop_recorder()
+    was_alive, _ = _stop_recorder_with_status()
     if not was_alive and pid is not None:
         click.echo("(recorder process had already exited — salvaging partial audio.)")
 
-    _finish_session(cfg, session_id, model_override=model, vad_filter=vad)
+    _finish_session_with_status(cfg, session_id, model_override=model, vad_filter=vad)
+
+
+def _stop_recorder_with_status() -> tuple[bool, int | None]:
+    """Stop the recorder daemon while showing a spinner.
+
+    Wraps recorder.stop_recorder(): the daemon drains its in-flight audio and
+    closes the WAV on SIGTERM, which can take up to STOP_TIMEOUT_S (5s). The
+    spinner makes that wait visible instead of looking like a hang.
+    """
+    with Status("[cyan]Stopping recorder…[/]", console=console, spinner="dots"):
+        return recorder.stop_recorder()
+
+
+def _finish_session_with_status(
+    cfg: config.RecConfig,
+    session_id: str,
+    *,
+    model_override: str | None,
+    vad_filter: bool,
+) -> None:
+    """Finish a session (silence check + transcription) with a single spinner.
+
+    Without feedback the terminal is silent for several seconds after Ctrl+C
+    while the audio levels are analyzed (soundfile read + numpy) and faster-
+    whisper is loaded lazily on first use — which reads as a hang. This shows
+    one "working" spinner for the silence-check phase. It is stopped before any
+    result/warning text prints, and before transcription, at which point the
+    transcriber's own Rich progress bar takes over the display.
+    """
+    with Status("[cyan]Analyzing captured audio…[/]", console=console, spinner="dots") as status:
+        _finish_session(
+            cfg, session_id,
+            model_override=model_override, vad_filter=vad_filter,
+            status=status,
+        )
 
 
 def _finish_session(
@@ -423,6 +466,7 @@ def _finish_session(
     *,
     model_override: str | None,
     vad_filter: bool,
+    status: Status | None = None,
 ) -> None:
     """Run the silence check + transcription for a just-stopped session.
 
@@ -435,6 +479,11 @@ def _finish_session(
     transcript. The session is marked SILENT instead. The WAV is kept on disk
     so `rec diagnose` can inspect it. If only one source of a mic+system
     recording is silent, the other still gets transcribed.
+
+    `status` is an optional rich.status.Status shown by the caller during this
+    phase. It's stopped before any user-facing output so messages don't print
+    under a still-spinning spinner, and before transcription so the
+    transcriber's own progress bar can render cleanly.
     """
     log_mod.set_session_context(session_id)
 
@@ -444,6 +493,8 @@ def _finish_session(
         # The daemon was stopped before it opened either WAV (very fast Ctrl+C,
         # or it crashed at startup). Nothing to transcribe — say so clearly
         # rather than crashing, and mark the session so `rec list` reflects it.
+        if status is not None:
+            status.stop()
         session.update_meta(session_id, status=session.STATUS_RECORDED, duration=0.0, word_count=0)
         click.secho(
             "No audio was captured (stopped too quickly, or the tap failed to start). "
@@ -469,6 +520,11 @@ def _finish_session(
             meta.extra["mic_audio_rms"] = round(mic_levels.rms, 6)
             meta.extra["mic_audio_silent"] = mic_levels.silent
         session.save_meta(meta)
+
+    # Silence warnings + transcription both print to the console; stop the
+    # spinner so that output isn't drawn under it.
+    if status is not None:
+        status.stop()
 
     _warn_if_silent(sys_levels, mic_levels)
 

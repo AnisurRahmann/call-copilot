@@ -246,6 +246,56 @@ def test_run_live_recording_finishes_on_keyboard_interrupt(monkeypatch, cfg_writ
     assert session.load_meta(sid).status == session.STATUS_TRANSCRIBED
 
 
+def test_run_live_recording_stops_daemon_before_finishing(monkeypatch, cfg_written, fake_transcribe, fake_audio_levels):
+    """Regression: the live (Ctrl+C) path must call stop_recorder() before
+    finishing the session.
+
+    The recorder daemon runs in its own session (start_new_session=True), so
+    Ctrl+C does NOT propagate to it — without an explicit stop_recorder() call
+    it keeps recording as an orphan and _finish_session would read a WAV still
+    being written. This test makes the WAV appear ONLY when stop_recorder runs,
+    so a finish-before-stop ordering falls into the no-audio branch instead of
+    transcribing, and asserts stop_recorder was called exactly once.
+    """
+    from rich.console import Console as _C
+    monkeypatch.setattr(cli, "console", _C(quiet=True))
+
+    calls = {"active_n": 0, "stop_n": 0}
+
+    def active_pid():
+        calls["active_n"] += 1
+        if calls["active_n"] >= 2:
+            raise KeyboardInterrupt
+        return 4321
+
+    sid_holder = {"id": None}
+
+    def stop_recorder():
+        calls["stop_n"] += 1
+        # Simulate the daemon finalizing the WAV: it now exists on disk. If
+        # _finish_session ran before this, it would see no WAV at all.
+        assert sid_holder["id"] is not None
+        session.wav_path(sid_holder["id"]).write_bytes(b"x")
+        return (True, 4321)
+
+    monkeypatch.setattr(recorder, "active_pid", active_pid)
+    monkeypatch.setattr(recorder, "stop_recorder", stop_recorder)
+
+    sid = session.new_session_id()
+    sid_holder["id"] = sid
+    session.update_meta(sid, status=session.STATUS_RECORDING, started_at="2026-07-28T14:00:00")
+    session.create_session_dir(sid)
+    # NOTE: WAV is deliberately NOT pre-written — stop_recorder produces it.
+
+    cfg = config.load_config()
+    cli._run_live_recording(cfg, sid, model_override=None, vad_filter=False)
+
+    # stop_recorder was called exactly once (not zero, not duplicated).
+    assert calls["stop_n"] == 1, f"stop_recorder called {calls['stop_n']} times, expected 1"
+    # And the session was transcribed (proves stop ran before finish).
+    assert session.load_meta(sid).status == session.STATUS_TRANSCRIBED
+
+
 def test_start_reports_spawn_failure(monkeypatch, cfg_written):
     monkeypatch.setattr(recorder, "active_pid", lambda: None)
 
