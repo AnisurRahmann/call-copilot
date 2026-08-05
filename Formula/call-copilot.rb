@@ -56,10 +56,22 @@ class CallCopilot < Formula
 
     # Link only the user-facing CLI onto PATH (deps stay isolated in libexec).
     bin.install_symlink venv_bin/"rec"
-    # NOTE: `brew install` prints a harmless "Failed to fix install linkage"
-    # warning for audiotap's prebuilt libaudiotap.dylib (its mach-o header has
-    # no room for Homebrew's dylib-ID rewrite). The dylib loads fine via @rpath
-    # and `rec` works correctly — the warning can be ignored.
+  end
+
+  def caveats
+    <<~EOS
+      call-copilot is ready to use. Run:
+
+          rec setup     # one-time: verify macOS, audio taps, and permissions
+          rec start     # start recording — press Ctrl+C to stop & transcribe
+
+      Heads up on the install log:
+      You may have seen "Failed to fix install linkage" for
+      audiotap/libaudiotap.dylib. It is expected and harmless — Homebrew tries
+      to rewrite the dylib's id, but its mach-o header was built without spare
+      space, so the rewrite is skipped. The library is loaded by absolute path
+      via ctypes and `rec` works correctly. No action needed.
+    EOS
   end
 
   test do
