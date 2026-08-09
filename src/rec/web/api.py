@@ -40,6 +40,10 @@ def register(routes: dict[tuple[str, str], tuple]) -> None:
             ("GET", "/api/sessions/{id}"): (get_session_detail, ["id"]),
             ("GET", "/api/sessions/{id}/audio/{stream}"): (get_audio, ["id", "stream"]),
             ("GET", "/api/search"): (get_search, []),
+            ("POST", "/api/recording/start"): (post_start, []),
+            ("POST", "/api/recording/stop"): (post_stop, []),
+            ("GET", "/api/jobs/{job_id}"): (get_job, ["job_id"]),
+            ("POST", "/api/sessions/{id}/transcribe"): (post_transcribe, ["id"]),
         }
     )
 
@@ -396,3 +400,141 @@ def _speaker_label(speaker: str | None) -> str | None:
     if not speaker:
         return None
     return f"[{speaker}]"
+
+
+# ---- POST /api/recording/start --------------------------------------------
+# These mutating endpoints import jobs lazily so the read-only server never
+# carries the worker pool at import time.
+
+
+_VALID_CAPTURES = {"system", "mic", "mic+system"}
+
+
+def post_start(h: WebHandler) -> None:
+    """Start a recording via the detached spawn path (mirrors `rec start --detach`).
+
+    Body ``{"capture": "mic+system" | "mic" | "system"}`` (default: config).
+    Returns ``201 {session_id}``. ``409`` if already recording.
+    """
+    from . import jobs  # noqa: F401 (kept lazy; not used directly here)
+
+    if recorder.active_pid() is not None:
+        raise _ApiError(HTTPStatus.CONFLICT, "Already recording. Stop the current one first.")
+    try:
+        cfg = config.load_config()
+    except Exception:
+        raise _ApiError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "No config found. Run `rec setup` in a terminal first.",
+        ) from None
+    body = h._read_json()
+    capture = (body.get("capture") or cfg.capture).strip().lower()
+    if capture not in _VALID_CAPTURES:
+        raise _ApiError(
+            HTTPStatus.BAD_REQUEST,
+            f"capture must be one of: {', '.join(sorted(_VALID_CAPTURES))}.",
+        )
+
+    from datetime import datetime
+
+    session_id = session.new_session_id()
+    session.create_session_dir(session_id)
+    session.update_meta(
+        session_id,
+        started_at=datetime.now().isoformat(timespec="seconds"),
+        status=session.STATUS_RECORDING,
+        capture=capture,
+    )
+    try:
+        recorder.spawn_recorder(session_id, cfg.sample_rate, cfg.channels, capture)
+    except Exception as e:
+        raise _ApiError(
+            HTTPStatus.INTERNAL_SERVER_ERROR, f"Failed to start recording: {e}."
+        ) from e
+    h._send_json(HTTPStatus.CREATED, {"session_id": session_id, "capture": capture})
+
+
+# ---- POST /api/recording/stop ---------------------------------------------
+
+
+def post_stop(h: WebHandler) -> None:
+    """Stop the active recording, then queue transcription.
+
+    Returns ``202 {session_id, job_id}``. The UI polls /api/jobs/{job_id}.
+    ``409`` if not recording, or if a transcription job is already queued/running.
+    """
+    from . import jobs
+
+    if recorder.active_pid() is None:
+        raise _ApiError(HTTPStatus.CONFLICT, "Not recording.")
+    session_id = _current_recording_session_id()
+    if session_id is None:
+        raise _ApiError(
+            HTTPStatus.CONFLICT,
+            "Recording is active but no recording session was found on disk.",
+        )
+    recorder.stop_recorder()
+    try:
+        job = jobs.registry.queue(session_id, kind=jobs.JOB_FINISH)
+    except jobs.DuplicateJob:
+        raise _ApiError(
+            HTTPStatus.CONFLICT,
+            "A transcription is already running for this session.",
+        ) from None
+    h._send_json(HTTPStatus.ACCEPTED, {"session_id": session_id, "job_id": job.id})
+
+
+def _current_recording_session_id() -> str | None:
+    """The id of the session in STATUS_RECORDING, else the newest overall."""
+    metas = session.list_sessions()
+    if not metas:
+        return None
+    for m in metas:
+        if m.status == session.STATUS_RECORDING:
+            return m.id
+    return metas[0].id
+
+
+# ---- GET /api/jobs/{job_id} ------------------------------------------------
+
+
+def get_job(h: WebHandler, job_id: str) -> None:
+    """Poll a transcription job's state. 404 if the id is unknown."""
+    from . import jobs
+
+    job = jobs.registry.get(job_id)
+    if job is None:
+        raise _ApiError(HTTPStatus.NOT_FOUND, f"No job {job_id}.")
+    h._send_json(HTTPStatus.OK, job.to_dict())
+
+
+# ---- POST /api/sessions/{id}/transcribe -----------------------------------
+
+
+def post_transcribe(h: WebHandler, id: str) -> None:
+    """Re-transcribe an existing session at a (maybe different) model.
+
+    Body ``{"model": "base" | "small" | ...}`` (optional; defaults to config).
+    Returns ``202 {job_id}``. ``409`` if a job is already queued/running for it.
+    """
+    from . import jobs
+
+    meta = session.load_meta(id)
+    if meta is None:
+        raise _ApiError(HTTPStatus.NOT_FOUND, f"No session {id}.")
+    body = h._read_json()
+    model_override = body.get("model")
+    if model_override is not None:
+        if not isinstance(model_override, str) or not model_override.strip():
+            raise _ApiError(HTTPStatus.BAD_REQUEST, "model must be a non-empty string.")
+        model_override = model_override.strip()
+    try:
+        job = jobs.registry.queue(
+            id, kind=jobs.JOB_TRANSCRIBE, model_override=model_override
+        )
+    except jobs.DuplicateJob:
+        raise _ApiError(
+            HTTPStatus.CONFLICT,
+            "A transcription is already running for this session.",
+        ) from None
+    h._send_json(HTTPStatus.ACCEPTED, {"job_id": job.id, "session_id": id})

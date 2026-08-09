@@ -14,7 +14,7 @@ from http.client import HTTPConnection
 
 import pytest
 
-from rec import recorder, session
+from rec import config, recorder, session
 from rec.web import server
 
 # ---- shared web_server fixture (local; mirrors test_web_server) ------------
@@ -49,6 +49,23 @@ def _get(host: str, port: int, path: str, *, headers: dict[str, str] | None = No
 def _json(host, port, path):
     status, body, _ = _get(host, port, path)
     return status, json.loads(body)
+
+
+def _post(host: str, port: int, path: str, body: dict | None = None) -> tuple[int, dict]:
+    conn = HTTPConnection(host, port, timeout=5)
+    try:
+        payload = json.dumps(body).encode() if body is not None else b""
+        headers = {"Host": f"127.0.0.1:{port}", "Content-Type": "application/json"}
+        conn.request("POST", path, body=payload, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+        try:
+            parsed = json.loads(data) if data else {}
+        except json.JSONDecodeError:
+            parsed = {"_raw": data.decode("utf-8", "replace")}
+        return resp.status, parsed
+    finally:
+        conn.close()
 
 
 # ---- session-tree helpers (inline, like test_cli.py) ----------------------
@@ -375,4 +392,153 @@ def test_audio_mic_stream_served(web_server, xdg):
     )
     assert status == 206
     assert body == _AUDIO[0:16]
+
+
+# ---- POST /api/recording/start, /stop, retranscribe, GET /api/jobs --------
+
+
+def _write_config():
+    config.save_config(config.default_config())
+
+
+# start --------------------------------------------------------------------
+
+
+def test_start_spawns_recorder_and_returns_session(web_server, monkeypatch, xdg):
+    _write_config()
+    spawned: list[tuple] = []
+    monkeypatch.setattr(recorder, "active_pid", lambda: None)
+    monkeypatch.setattr(
+        recorder, "spawn_recorder",
+        lambda sid, sr, ch, cap: spawned.append((sid, sr, ch, cap)) or 4321,
+    )
+    host, port = web_server
+    status, payload = _post(host, port, "/api/recording/start", {"capture": "system"})
+    assert status == 201
+    assert payload["session_id"]
+    assert payload["capture"] == "system"
+    assert len(spawned) == 1
+    assert spawned[0][3] == "system"  # capture passed through
+    # The session is on disk in RECORDING state.
+    assert session.load_meta(payload["session_id"]).status == session.STATUS_RECORDING
+
+
+def test_start_409_if_already_recording(web_server, monkeypatch, xdg):
+    _write_config()
+    monkeypatch.setattr(recorder, "active_pid", lambda: 4321)
+    host, port = web_server
+    status, payload = _post(host, port, "/api/recording/start")
+    assert status == 409
+    assert payload["error"]
+
+
+def test_start_without_config_gives_setup_hint(web_server, monkeypatch, xdg):
+    # No config written; active_pid None so we reach the config check.
+    monkeypatch.setattr(recorder, "active_pid", lambda: None)
+    host, port = web_server
+    status, payload = _post(host, port, "/api/recording/start")
+    assert status == 500
+    assert "rec setup" in payload["error"].lower()
+
+
+def test_start_bad_capture_is_400(web_server, monkeypatch, xdg):
+    _write_config()
+    monkeypatch.setattr(recorder, "active_pid", lambda: None)
+    host, port = web_server
+    status, payload = _post(host, port, "/api/recording/start", {"capture": "telepathy"})
+    assert status == 400
+    assert payload["error"]
+
+
+# stop ---------------------------------------------------------------------
+
+
+def test_stop_queues_transcribe_job(web_server, monkeypatch, xdg):
+    _write_config()
+    sid = _make_session(status=session.STATUS_RECORDING, duration=None, word_count=None)
+    monkeypatch.setattr(recorder, "active_pid", lambda: 4321)
+    monkeypatch.setattr(recorder, "stop_recorder", lambda: (True, 4321))
+    # Stub the worker so no real transcription runs.
+    from rec.web import jobs
+    monkeypatch.setattr(jobs, "_run_finish", lambda *a, **k: None)
+
+    host, port = web_server
+    status, payload = _post(host, port, "/api/recording/stop")
+    assert status == 202
+    assert payload["session_id"] == sid
+    assert payload["job_id"]
+    # The job is pollable.
+    jstatus, job = _get_job(host, port, payload["job_id"])
+    assert jstatus == 200
+    assert job["session_id"] == sid
+    # Drain the worker so the pool shuts down cleanly for the next test.
+    jobs.registry.shutdown()
+
+
+def test_stop_409_if_not_recording(web_server, monkeypatch, xdg):
+    monkeypatch.setattr(recorder, "active_pid", lambda: None)
+    host, port = web_server
+    status, payload = _post(host, port, "/api/recording/stop")
+    assert status == 409
+    assert payload["error"]
+
+
+def _get_job(host, port, job_id):
+    return _json(host, port, f"/api/jobs/{job_id}")
+
+
+def test_get_job_404_for_unknown_id(web_server, xdg):
+    host, port = web_server
+    status, payload = _json(host, port, "/api/jobs/nope0000nope")
+    assert status == 404
+    assert payload["error"]
+
+
+# retranscribe -------------------------------------------------------------
+
+
+def test_retranscribe_queues_transcribe_job(web_server, monkeypatch, xdg):
+    _write_config()
+    sid = _make_session(status=session.STATUS_TRANSCRIBED, model="tiny")
+    from rec.web import jobs
+    monkeypatch.setattr(jobs, "_run_transcribe", lambda *a, **k: None)
+
+    host, port = web_server
+    status, payload = _post(host, port, f"/api/sessions/{sid}/transcribe", {"model": "medium"})
+    assert status == 202
+    assert payload["job_id"]
+    jobs.registry.shutdown()
+
+
+def test_retranscribe_404_for_missing_session(web_server, monkeypatch, xdg):
+    _write_config()
+    host, port = web_server
+    missing = "2020-01-01_00-00-00"
+    status, payload = _post(host, port, f"/api/sessions/{missing}/transcribe", {"model": "base"})
+    assert status == 404
+    assert payload["error"]
+
+
+def test_retranscribe_409_on_duplicate(web_server, monkeypatch, xdg):
+    """A running job for the session blocks a second re-transcribe."""
+    _write_config()
+    sid = _make_session(status=session.STATUS_TRANSCRIBED)
+    from rec.web import jobs
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow(*a, **k):
+        started.set()
+        release.wait(timeout=2.0)
+
+    monkeypatch.setattr(jobs, "_run_transcribe", slow)
+    host, port = web_server
+    status1, payload1 = _post(host, port, f"/api/sessions/{sid}/transcribe", {"model": "base"})
+    assert status1 == 202
+    assert started.wait(timeout=2.0)
+    # Second request while the first runs -> 409.
+    status2, payload2 = _post(host, port, f"/api/sessions/{sid}/transcribe", {"model": "base"})
+    assert status2 == 409
+    release.set()
+    jobs.registry.shutdown()
 
