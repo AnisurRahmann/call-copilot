@@ -33,6 +33,10 @@ dependencies = [
     "rich>=13.0",
     "pydantic>=2.0",
     "numpy>=1.24",
+    # MCP server (the `rec mcp` command — exposes transcripts to Claude Code
+    # and any other MCP client over stdio). Pinned to the v2 line: the SDK API
+    # we use (from mcp.server import MCPServer) landed in 2.0.
+    "mcp>=2,<3",
 ]
 
 [project.urls]

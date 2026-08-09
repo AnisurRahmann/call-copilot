@@ -145,6 +145,51 @@ with `rec status`).
 > playing, or the capture permission was revoked. `rec start` (and `rec stop`) warn you
 > about this immediately, and `rec diagnose <session>` bundles the audio levels + logs.
 
+## Use your meetings from Claude Code
+
+`rec` ships an **MCP server** (the open protocol Claude Code, Cursor, Zed, Cline, and
+other AI tools speak). Point any MCP client at your locally-recorded transcripts and ask
+questions about them — answers come back with the **session id cited**, so you can check
+the exact moment. Nothing leaves your machine: the server is strictly read-only and makes
+no network calls.
+
+```bash
+rec mcp install     # writes the server entry into Claude Code's config
+```
+
+Then restart Claude Code and ask, for example:
+
+- *"What did the client actually ask for on Tuesday's call?"* — it searches the transcripts,
+  finds the line, and cites the session id (e.g. `2026-07-28_12-25-20`) with a timestamp.
+- *"List my meetings from last week with their durations."* — it lists sessions, narrowing
+  by date.
+- *"Show me the full transcript of the standup where we discussed the API migration."* — it
+  finds the session, then reads the whole transcript.
+
+Three tools are exposed: `list_sessions` (find a meeting by date), `get_session` (read a
+whole transcript), and `search_transcripts` (find specific lines across long transcripts —
+pass it **keywords** like `pricing discount`, not a full sentence). The search index lives
+at `~/.local/share/rec/index.db`; it builds lazily on first search and is a disposable cache
+— `rec index` refreshes it, `rec index --rebuild` recreates it from scratch.
+
+### Other MCP clients (Cursor, Zed, Cline, …)
+
+`rec mcp install` prints a config block that works in any MCP client. For Cursor, paste it
+into `.cursor/mcp.json`; for Zed, into `settings.json` under `mcp_servers`. It looks like:
+
+```json
+{
+  "call-copilot": {
+    "type": "stdio",
+    "command": "rec",
+    "args": ["mcp"]
+  }
+}
+```
+
+You can also run the server directly with `rec mcp` (stdio transport) if a client prefers a
+raw command.
+
 ## Configuration
 
 Stored at `~/.config/rec/config.json` (XDG). Recordings live under

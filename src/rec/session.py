@@ -9,6 +9,7 @@ Each session lives in {sessions_root}/{id}/ containing:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,37 @@ RECORDING_FILENAME = "recording.wav"          # system audio
 MIC_RECORDING_FILENAME = "recording-mic.wav"  # microphone
 SESSION_META_FILENAME = "session.json"
 TRANSCRIPT_FILENAME = "transcript.md"
+
+
+class InvalidSessionId(ValueError):
+    """Raised when a session id could escape the sessions root (path traversal).
+
+    Session ids are always a single filesystem-safe segment
+    (`YYYY-MM-DD_HH-MM-SS`). Anything containing a path separator or a `..`
+    component is rejected before it reaches a `Path` join, so an untrusted id
+    (e.g. one supplied to the MCP `get_session` tool by a prompt-injected
+    model) cannot read files outside the sessions store.
+    """
+
+
+def validate_session_id(session_id: str) -> str:
+    """Return `session_id` if it is safe to join under the sessions root.
+
+    A safe id is a single path segment: it must be non-empty, contain no path
+    separator (`/` or `os.sep`), and not be `.` or `..`. This blocks traversal
+    (`../stolen`) and absolute paths (`/etc/...`) at the lowest level, before
+    any `Path` join. Raises `InvalidSessionId` otherwise.
+
+    Real session ids (`2026-07-28_12-25-20`) always pass.
+    """
+    if not session_id or session_id in (".", ".."):
+        raise InvalidSessionId(f"invalid session id: {session_id!r}")
+    # Reject any platform separator, plus the generic `/` and `\`, and any
+    # path component that resolves up the tree. `os.altsep` is `\` on Windows.
+    seps = {"/", "\\", os.sep} | ({os.altsep} if os.altsep else set())
+    if any(ch in session_id for ch in seps):
+        raise InvalidSessionId(f"session id must not contain a path separator: {session_id!r}")
+    return session_id
 
 # Valid lifecycle statuses.
 STATUS_RECORDING = "recording"
@@ -43,6 +75,8 @@ def new_session_id(now: datetime | None = None) -> str:
 
 
 def session_dir(session_id: str) -> Path:
+    """Path to a session's directory. Validates the id to block traversal."""
+    validate_session_id(session_id)
     return config.sessions_root() / session_id
 
 
@@ -140,6 +174,55 @@ def list_sessions() -> list[SessionMeta]:
             out.append(meta)
     log.debug("listed %d sessions from %s", len(out), root)
     return out
+
+
+class AmbiguousSessionId(ValueError):
+    """Raised by resolve_session_id when a prefix matches more than one session.
+
+    Carries the candidate ids so a caller (the MCP `get_session` tool, surfaced
+    to the model as a tool error) can show them and let the user/agent pick,
+    rather than silently guessing the newest one.
+    """
+
+    def __init__(self, query: str, matches: list[str]):
+        self.query = query
+        self.matches = matches
+        super().__init__(
+            f"Session prefix {query!r} matches {len(matches)} sessions: "
+            f"{', '.join(matches)}. Use a longer prefix or the full id."
+        )
+
+
+def resolve_session_id(query: str) -> str | None:
+    """Resolve a (possibly partial) session id to a real one.
+
+    Accepts the full id ('2026-07-27_14-30-00') or any UNIQUE prefix
+    ('2026-07-27' when only one session starts that way). Returns the resolved
+    id, or None if nothing matches. Raises `AmbiguousSessionId` (a ValueError
+    subclass) if the prefix matches more than one session — callers should let
+    that propagate so the user/agent sees the candidates instead of a silent
+    newest-first guess.
+
+    Shared by `rec diagnose` and the MCP `get_session` tool so neither reaches
+    into the other.
+    """
+    # Reject traversal up front — an id like '../stolen' must never reach a
+    # Path join (see validate_session_id). Treat it as "no match" so the caller
+    # surfaces a clean "no session" message rather than a traceback.
+    try:
+        valid = validate_session_id(query)
+    except InvalidSessionId:
+        return None
+    # Exact match first.
+    if session_dir(valid).exists():
+        return valid
+    # Prefix match against all session dirs (newest-first).
+    matches = [m.id for m in list_sessions() if m.id.startswith(query)]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise AmbiguousSessionId(query, matches)
+    return matches[0]
 
 
 # ---- formatters -----------------------------------------------------------
