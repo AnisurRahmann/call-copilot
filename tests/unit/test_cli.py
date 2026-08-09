@@ -6,6 +6,7 @@ and the transcriber's whisper model are both mocked.
 
 from __future__ import annotations
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -760,7 +761,7 @@ def test_help_lists_all_commands():
     res = CliRunner().invoke(cli.cli, ["--help"])
     assert res.exit_code == 0
     for cmd in ("setup", "start", "stop", "list", "status", "transcribe", "diagnose",
-                "mcp", "index"):
+                "mcp", "index", "web"):
         assert cmd in res.output
 
 
@@ -769,6 +770,57 @@ def test_mcp_help_lists_install_subcommand():
     res = CliRunner().invoke(cli.cli, ["mcp", "--help"])
     assert res.exit_code == 0
     assert "install" in res.output
+
+
+# ---- web (local browser UI) ----------------------------------------------
+
+
+def test_web_help_reads_correctly():
+    """`rec web --help` shows the port flag and the loopback-only rationale."""
+    res = CliRunner().invoke(cli.cli, ["web", "--help"])
+    assert res.exit_code == 0
+    assert "--port" in res.output
+    assert "--no-open" in res.output
+    # No --host flag is offered (loopback-only is the security model).
+    assert "--host" not in res.output
+
+
+def test_web_bypasses_envcheck(xdg, monkeypatch):
+    """`rec web` runs even where audio capture can't (it's read-mostly)."""
+    # Force envcheck to fail; the read-only gate must skip it for `web`.
+    def boom():
+        raise click.ClickException("rec only runs on macOS 14.2 or later.")
+    monkeypatch.setattr(cli.envcheck, "check_runtime", boom)
+    # Patch serve() so we don't actually start a blocking server.
+    from rec.web import server as web_server
+    called: list = []
+    monkeypatch.setattr(
+        web_server, "serve",
+        lambda port, open_browser: called.append((port, open_browser)),
+    )
+    res = CliRunner().invoke(cli.cli, ["web"])
+    assert res.exit_code == 0, res.output
+    assert called == [(7717, True)]
+
+
+def test_web_port_collision_prints_one_line(xdg, monkeypatch):
+    """An occupied port exits non-zero with a clean message, never a traceback."""
+    import socket
+
+    # Grab a port that's in use, then ask `rec web` to bind it.
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    occupied = holder.getsockname()[1]
+    try:
+        res = CliRunner().invoke(cli.cli, ["web", "--port", str(occupied), "--no-open"])
+    finally:
+        holder.close()
+    assert res.exit_code != 0
+    assert str(occupied) in res.output
+    assert "--port" in res.output
+    # No traceback: the message is a ClickException, printed as "Error: ...".
+    assert "Traceback" not in res.output
 
 
 def test_version():

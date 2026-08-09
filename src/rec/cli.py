@@ -71,7 +71,7 @@ def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
     # transcripts on disk and have nothing to do with audiotap/Core Audio, so
     # they must run on any machine that has transcripts to read (including a
     # non-Mac where recordings were copied in, or in CI).
-    _READ_ONLY_COMMANDS = {"mcp", "index"}
+    _READ_ONLY_COMMANDS = {"mcp", "index", "web"}
     if ctx.invoked_subcommand not in _READ_ONLY_COMMANDS:
         envcheck.check_runtime()
     _setup_logging_for_run(verbose, quiet, ctx.invoked_subcommand)
@@ -773,6 +773,38 @@ def diagnose(session_id: str, global_log_lines: int, to_stdout: bool) -> None:
     click.echo(f"Diagnose bundle written: {out_path} ({len(bundle):,} bytes)")
     if to_stdout:
         click.echo(bundle)
+
+
+# ---- web (local browser UI) ----------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--port",
+    type=int,
+    default=7717,
+    show_default=True,
+    help="Port to serve the browser UI on (127.0.0.1 only).",
+)
+@click.option(
+    "--no-open",
+    is_flag=True,
+    help="Do not open a browser tab automatically.",
+)
+def web(port: int, no_open: bool) -> None:
+    """Open a local browser UI for browsing sessions and recordings.
+
+    Serves a single-page app on 127.0.0.1 that lists sessions, plays audio,
+    reads transcripts, searches, and starts/stops a recording — modelled on the
+    qBittorrent/Transmission web UI. Bound to loopback only; the host is not
+    configurable, by design (a local tool must not become an open transcript
+    server). Viewing transcripts has nothing to do with audio capture, so this
+    command skips the macOS/audiotap envcheck and runs anywhere transcripts
+    exist. The Start button returns a clear error if config is missing.
+    """
+    from .web import server as web_server
+
+    web_server.serve(port=port, open_browser=not no_open)
 
 
 # ---- mcp (expose transcripts to Claude Code / other MCP clients) -----------
