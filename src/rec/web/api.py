@@ -280,6 +280,7 @@ def get_audio(h: WebHandler, id: str, stream: str) -> None:
         h.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
         h.send_header("Content-Range", f"bytes */{total}")
         h.send_header("Content-Length", "0")
+        h.send_header("X-Content-Type-Options", "nosniff")
         h.end_headers()
         return
 
@@ -290,6 +291,7 @@ def get_audio(h: WebHandler, id: str, stream: str) -> None:
     h.send_header("Content-Length", str(len(chunk)))
     h.send_header("Content-Range", f"bytes {spec.start}-{spec.end}/{total}")
     h.send_header("Accept-Ranges", "bytes")
+    h.send_header("X-Content-Type-Options", "nosniff")
     h.end_headers()
     if h.command != "HEAD":
         h.wfile.write(chunk)
@@ -525,9 +527,18 @@ def post_transcribe(h: WebHandler, id: str) -> None:
     body = h._read_json()
     model_override = body.get("model")
     if model_override is not None:
-        if not isinstance(model_override, str) or not model_override.strip():
-            raise _ApiError(HTTPStatus.BAD_REQUEST, "model must be a non-empty string.")
+        if not isinstance(model_override, str):
+            raise _ApiError(HTTPStatus.BAD_REQUEST, "model must be a string.")
         model_override = model_override.strip()
+        # Whitelist: an unknown name would make faster-whisper treat it as a
+        # local path or trigger a large HuggingFace download. The SPA offers the
+        # same set; enforce it server-side so a stray caller can't.
+        allowed = {"tiny", "base", "small", "medium", "large-v3"}
+        if model_override not in allowed:
+            raise _ApiError(
+                HTTPStatus.BAD_REQUEST,
+                f"model must be one of: {', '.join(sorted(allowed))}.",
+            )
     try:
         job = jobs.registry.queue(
             id, kind=jobs.JOB_TRANSCRIBE, model_override=model_override

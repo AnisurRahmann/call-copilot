@@ -83,6 +83,9 @@ class WebHandler(BaseHTTPRequestHandler):
             if not self._host_ok():
                 self._send_error(HTTPStatus.FORBIDDEN, "Host not allowed.")
                 return
+            if method == "POST" and not self._csrf_ok():
+                self._send_error(HTTPStatus.FORBIDDEN, "Missing or invalid request header.")
+                return
             path = urllib.parse.urlsplit(self.path).path
             handler, params = _route(method, path)
             if handler is None:
@@ -92,7 +95,9 @@ class WebHandler(BaseHTTPRequestHandler):
         except _ApiError as e:
             self._send_error(e.status, e.message)
         except Exception:  # pragma: no cover — defensive, must not leak a traceback
-            log.exception("unhandled error serving %s %s", method, self.path)
+            # Log the path only — never self.path, which may carry a query
+            # string (e.g. a search term) we deliberately keep out of the log.
+            log.exception("unhandled error serving %s %s", method, urllib.parse.urlsplit(self.path).path)
             self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Something went wrong.")
 
     # ---- DNS-rebinding guard --------------------------------------------
@@ -108,6 +113,22 @@ class WebHandler(BaseHTTPRequestHandler):
         port = self.server.server_address[1]  # type: ignore[attr-defined]
         return host in (f"127.0.0.1:{port}", f"localhost:{port}")
 
+    # ---- CSRF guard -----------------------------------------------------
+
+    # The Host guard authenticates the *address*, not the *origin*: a malicious
+    # page the user visits while `rec web` runs can still POST to our loopback
+    # URL (the browser sets Host automatically, which the guard accepts). To
+    # block that, every mutating request must carry a custom header. Custom
+    # headers force a CORS preflight, and this server grants none, so a
+    # cross-origin POST never gets off the ground. Our SPA is same-origin and
+    # adds the header itself.
+    REQUIRED_HEADER = "X-Requested-With"
+    REQUIRED_HEADER_VALUE = "rec-web"
+
+    def _csrf_ok(self) -> bool:
+        """True if the request is same-origin (carries our custom header)."""
+        return self.headers.get(self.REQUIRED_HEADER) == self.REQUIRED_HEADER_VALUE
+
     # ---- response helpers ------------------------------------------------
 
     def _send_json(self, status: int, obj: object) -> None:
@@ -116,6 +137,7 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -130,6 +152,7 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
         for name, value in extra_headers or []:
             self.send_header(name, value)
         self.end_headers()
@@ -139,14 +162,25 @@ class WebHandler(BaseHTTPRequestHandler):
     def _send_error(self, status: int, message: str) -> None:
         self._send_json(status, {"error": message})
 
+    # Cap request bodies so a client (or a CSRF page) can't exhaust memory by
+    # declaring a huge Content-Length. 16 KiB is far more than any of our
+    # endpoints need (the biggest legal body is a tiny JSON object).
+    MAX_BODY_BYTES = 16 * 1024
+
     def _read_json(self) -> dict:
-        """Read and parse a JSON object body; raise _ApiError(400) on malformed input."""
+        """Read and parse a JSON object body; raise _ApiError on malformed/oversized input."""
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as e:
             raise _ApiError(HTTPStatus.BAD_REQUEST, "Invalid Content-Length.") from e
-        if length <= 0:
+        if length < 0:
+            raise _ApiError(HTTPStatus.BAD_REQUEST, "Invalid Content-Length.")
+        if length == 0:
             return {}
+        if length > self.MAX_BODY_BYTES:
+            raise _ApiError(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Request body is too large."
+            )
         raw = self.rfile.read(length)
         try:
             obj = json.loads(raw)

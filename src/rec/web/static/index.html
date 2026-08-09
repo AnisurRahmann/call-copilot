@@ -207,6 +207,15 @@ const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) =>
   ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
 
 async function api(path, opts) {
+  // Every mutating request carries a custom header. It's a CSRF guard: custom
+  // headers force a CORS preflight, which this server doesn't grant, so a
+  // cross-origin page can't POST to our loopback URL. Same-origin (this SPA)
+  // passes the check. See server._csrf_ok.
+  if (opts && opts.method === "POST") {
+    opts = Object.assign({}, opts, {
+      headers: Object.assign({ "X-Requested-With": "rec-web" }, opts.headers || {})
+    });
+  }
   const res = await fetch(path, opts);
   let body = null;
   const txt = await res.text();

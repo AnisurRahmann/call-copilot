@@ -51,11 +51,15 @@ def _json(host, port, path):
     return status, json.loads(body)
 
 
-def _post(host: str, port: int, path: str, body: dict | None = None) -> tuple[int, dict]:
+def _post(host: str, port: int, path: str, body: dict | None = None, *, header: bool = True) -> tuple[int, dict]:
+    """POST a JSON body. By default includes the X-Requested-With header the
+    CSRF guard requires; pass header=False to test the guard itself."""
     conn = HTTPConnection(host, port, timeout=5)
     try:
         payload = json.dumps(body).encode() if body is not None else b""
         headers = {"Host": f"127.0.0.1:{port}", "Content-Type": "application/json"}
+        if header:
+            headers["X-Requested-With"] = "rec-web"
         conn.request("POST", path, body=payload, headers=headers)
         resp = conn.getresponse()
         data = resp.read()
@@ -541,4 +545,39 @@ def test_retranscribe_409_on_duplicate(web_server, monkeypatch, xdg):
     assert status2 == 409
     release.set()
     jobs.registry.shutdown()
+
+
+# ---- security hardening: CSRF, body cap, model whitelist -----------------
+
+
+def test_post_without_csrf_header_is_403(web_server, xdg):
+    """A POST lacking the X-Requested-With header is refused — CSRF defence.
+
+    A cross-origin page can't set a custom header without a CORS preflight
+    (which this server doesn't grant), so this blocks drive-by Start/Stop."""
+    _write_config()
+    host, port = web_server
+    status, _ = _post(host, port, "/api/recording/start", {"capture": "mic"}, header=False)
+    assert status == 403
+
+
+def test_oversized_post_body_is_413(web_server, xdg):
+    """A Content-Length over the cap is rejected before reading the body."""
+    _write_config()
+    host, port = web_server
+    # Build a body just over the 16 KiB cap.
+    big = {"x": "a" * (20 * 1024)}
+    status, payload = _post(host, port, "/api/recording/start", big)
+    assert status == 413
+    assert payload["error"]
+
+
+def test_retranscribe_rejects_unknown_model(web_server, monkeypatch, xdg):
+    """An arbitrary model name is rejected server-side (no path/download vector)."""
+    _write_config()
+    sid = _make_session(status=session.STATUS_TRANSCRIBED)
+    host, port = web_server
+    status, payload = _post(host, port, f"/api/sessions/{sid}/transcribe", {"model": "../../etc/passwd"})
+    assert status == 400
+    assert "model" in payload["error"].lower() or payload["error"]
 
