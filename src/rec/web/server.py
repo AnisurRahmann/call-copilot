@@ -1,0 +1,329 @@
+"""Loopback HTTP server for ``rec web``.
+
+Built on stdlib ``http.server.ThreadingHTTPServer`` (no new runtime deps). The
+handler routes ``GET``/``POST`` to the read-only and mutating endpoints; this
+module owns the skeleton (loopback bind, the DNS-rebinding Host guard, the
+quiet access log, JSON helpers, and static-file serving). Endpoint bodies live
+here too and are kept small — they delegate to :mod:`rec.session`,
+:mod:`rec.recorder`, :mod:`rec.index`, and :mod:`rec.web.jobs`.
+
+Security model: bind ``127.0.0.1`` only, and reject any request whose ``Host``
+header is not ``127.0.0.1:<port>`` or ``localhost:<port>``. That one check
+closes the DNS-rebinding hole (a malicious page resolving a hostname to
+loopback to read your transcripts) without touching ``CORS`` or origin checks.
+
+Access log discipline: the global file handler runs at DEBUG, so the access
+log prints method, path, and status only — never a query string, never a body.
+"""
+
+from __future__ import annotations
+
+import errno
+import json
+import re
+import urllib.parse
+import webbrowser
+from collections.abc import Callable
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib import resources
+
+import click
+
+from ..log import get_logger
+
+log = get_logger(__name__)
+
+DEFAULT_PORT = 7717
+LOOPBACK_HOST = "127.0.0.1"
+
+# Session ids are always YYYY-MM-DD_HH-MM-SS (see session.new_session_id).
+# Validating every id from a URL against this exact shape blocks path traversal
+# before it reaches session_dir(); reject with 400, never sanitise-and-continue.
+_SESSION_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+
+# Map an incoming path to a handler. Static routes are exact; the dynamic
+# session routes carry a <id> placeholder resolved at dispatch time. Populated
+# by _build_routes() once at import time and shared by all handler instances.
+# (Endpoints are registered incrementally as this module grows; the skeleton
+# only needs GET / and the 404 fallback.)
+
+
+class _RecWebServer(ThreadingHTTPServer):
+    """Threading server with daemon threads so it dies with the process."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class WebHandler(BaseHTTPRequestHandler):
+    """Routes requests to endpoint handlers; enforces the loopback Host guard."""
+
+    # Quiet the default stderr access log — we print our own one-liner that
+    # deliberately omits query strings and bodies.
+    server_version = "rec-web/1.0"
+    sys_version = ""
+
+    # The protocol version stays at 1.1 so we can send Content-Length and keep
+    # connections alive; we always send a body or Content-Length: 0.
+    protocol_version = "HTTP/1.1"
+
+    # ---- request entry points --------------------------------------------
+
+    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        self._dispatch("GET")
+
+    def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        self._dispatch("POST")
+
+    # ---- routing ---------------------------------------------------------
+
+    def _dispatch(self, method: str) -> None:
+        try:
+            if not self._host_ok():
+                self._send_error(HTTPStatus.FORBIDDEN, "Host not allowed.")
+                return
+            path = urllib.parse.urlsplit(self.path).path
+            handler, params = _route(method, path)
+            if handler is None:
+                self._send_error(HTTPStatus.NOT_FOUND, "Not found.")
+                return
+            handler(self, **params)
+        except _ApiError as e:
+            self._send_error(e.status, e.message)
+        except Exception:  # pragma: no cover — defensive, must not leak a traceback
+            log.exception("unhandled error serving %s %s", method, self.path)
+            self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Something went wrong.")
+
+    # ---- DNS-rebinding guard --------------------------------------------
+
+    def _host_ok(self) -> bool:
+        """True if the Host header names loopback on our port.
+
+        Rejects DNS-rebinding attacks where a remote page resolves a hostname
+        to 127.0.0.1 and pokes the local server. We accept only the literal
+        loopback hostnames on the port we're actually bound to.
+        """
+        host = self.headers.get("Host", "")
+        port = self.server.server_address[1]  # type: ignore[attr-defined]
+        return host in (f"127.0.0.1:{port}", f"localhost:{port}")
+
+    # ---- response helpers ------------------------------------------------
+
+    def _send_json(self, status: int, obj: object) -> None:
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_bytes(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str,
+        *,
+        extra_headers: list[tuple[str, str]] | None = None,
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in extra_headers or []:
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _send_error(self, status: int, message: str) -> None:
+        self._send_json(status, {"error": message})
+
+    def _read_json(self) -> dict:
+        """Read and parse a JSON object body; raise _ApiError(400) on malformed input."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as e:
+            raise _ApiError(HTTPStatus.BAD_REQUEST, "Invalid Content-Length.") from e
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise _ApiError(HTTPStatus.BAD_REQUEST, "Request body is not valid JSON.") from e
+        if not isinstance(obj, dict):
+            raise _ApiError(HTTPStatus.BAD_REQUEST, "Request body must be a JSON object.")
+        return obj
+
+    # ---- quiet, redacted access log -------------------------------------
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 (signature)
+        # Print method + path + status only. Never the query string (it may
+        # carry a search term), never a body. Keeps transcript text and queries
+        # out of the global DEBUG log.
+        try:
+            status = int(getattr(self, "_status_code", 0))
+        except (TypeError, ValueError):
+            status = 0
+        path_only = urllib.parse.urlsplit(self.path).path
+        log.info("%s %s %d", self.command, path_only, status)
+
+    # BaseHTTPRequestHandler sends a 200 line to stderr by default; override
+    # log_request so our quiet log_message is the only access record.
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:  # noqa: ARG002
+        self.log_message("%s %s %s", self.command, self.path, code)
+
+
+class _ApiError(Exception):
+    """An error the dispatcher maps to an HTTP status + one-line message."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+# ---- static index ---------------------------------------------------------
+
+
+def _get_index(h: WebHandler) -> None:
+    """Serve the single-page app from package data."""
+    html = _load_static("index.html")
+    if html is None:
+        raise _ApiError(HTTPStatus.NOT_FOUND, "Web UI is not installed in this build.")
+    h._send_bytes(HTTPStatus.OK, html, "text/html; charset=utf-8")
+
+
+def _load_static(name: str) -> bytes | None:
+    """Read a file from rec.web/static, or None if absent (not yet added to the wheel)."""
+    try:
+        return (resources.files("rec.web") / "static" / name).read_bytes()
+    except (FileNotFoundError, ModuleNotFoundError):
+        return None
+
+
+# ---- routing table ---------------------------------------------------------
+
+
+# A route handler takes the handler instance plus any captured path params.
+RouteHandler = Callable[..., None]
+
+
+def _build_routes() -> dict[tuple[str, str], tuple[RouteHandler, list[str]]]:
+    """Return {(method, pattern): (handler, param_names)}.
+
+    Patterns use a ``{name}`` placeholder for the single dynamic segment we
+    support (the session id). More complex routing isn't worth a framework.
+
+    The /api/* routes are registered incrementally as their handlers land
+    (T4 read-only, T5 audio, T7 mutating). The skeleton ships GET / only.
+    """
+    routes: dict[tuple[str, str], tuple[RouteHandler, list[str]]] = {
+        ("GET", "/"): (_get_index, []),
+    }
+    # Late import so this module stays importable before api.py exists.
+    try:
+        from . import api  # noqa: F401
+    except ImportError:
+        api = None  # type: ignore[assignment]
+    if api is not None:
+        api.register(routes)
+    return routes
+
+
+def _route(method: str, path: str) -> tuple[RouteHandler | None, dict[str, str]]:
+    """Resolve a (method, path) to its handler and captured params.
+
+    Returns (None, {}) for an unmatched path or wrong method. A session id
+    captured from the URL is validated here so no handler ever receives an
+    untrusted id.
+    """
+    for (m, pattern), (handler, names) in _ROUTES.items():
+        if m != method:
+            continue
+        params, ok = _match(pattern, path)
+        if not ok:
+            continue
+        # Validate any captured 'id' (session id) before it reaches a handler.
+        if "id" in params and not _SESSION_ID_RE.match(params["id"]):
+            raise _ApiError(
+                HTTPStatus.BAD_REQUEST, "Invalid session id."
+            )
+        # Only pass the named params the handler expects.
+        return handler, {n: params[n] for n in names}
+    return None, {}
+
+
+def _match(pattern: str, path: str) -> tuple[dict[str, str], bool]:
+    """Match a ``{name}``-pattern against a path; return (params, ok)."""
+    if "{" not in pattern:
+        return {}, path == pattern
+    # Split into literal segments and placeholders, e.g. /api/sessions/{id}/audio/{stream}
+    seg_pat = pattern.split("/")
+    seg_path = path.split("/")
+    if len(seg_pat) != len(seg_path):
+        return {}, False
+    params: dict[str, str] = {}
+    for sp, sp_path in zip(seg_pat, seg_path):
+        if sp.startswith("{") and sp.endswith("}"):
+            params[sp[1:-1]] = urllib.parse.unquote(sp_path)
+        elif sp != sp_path:
+            return {}, False
+    return params, True
+
+
+# Built once at import time, after the handler functions above exist.
+_ROUTES = _build_routes()
+
+
+# ---- entry point ----------------------------------------------------------
+
+
+def make_server(port: int, handler_cls: type[BaseHTTPRequestHandler] = WebHandler) -> _RecWebServer:
+    """Construct the loopback server. Raises click.ClickException on EADDRINUSE.
+
+    Bound to 127.0.0.1 only; the host is not configurable. Caller handles
+    browser-open and serve_forever().
+    """
+    try:
+        return _RecWebServer((LOOPBACK_HOST, port), handler_cls)
+    except OSError as e:
+        # EADDRINUSE (48 on macOS, 98 on Linux) — the common case. Print one
+        # clean line naming the port and the override flag, never a traceback.
+        if e.errno in (errno.EADDRINUSE, getattr(errno, "EACCES", 13)):
+            raise click.ClickException(
+                f"Port {port} is already in use. Try another with --port, "
+                f"or close the other process holding it."
+            ) from e
+        raise click.ClickException(f"Could not start the web server: {e}") from e
+
+
+def serve(port: int = DEFAULT_PORT, *, open_browser: bool = True) -> None:
+    """Start the loopback server. Blocks until interrupted.
+
+    Sets the logging command context to 'web' (the global file handler still
+    runs at DEBUG), opens a browser tab unless suppressed, and prints the URL
+    once so a headless/SSH user can copy it.
+    """
+    from .. import log as log_mod
+
+    log_mod.set_command_context("web")
+    server = make_server(port)
+    bound_port = server.server_address[1]
+    url = f"http://127.0.0.1:{bound_port}/"
+    log.info("rec web serving on %s", url)
+    # Echo to stdout (not the log) so the user sees the URL plainly.
+    print(f"rec web: {url}")
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:  # pragma: no cover — browser open is best-effort
+            log.warning("could not open a browser automatically")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+        server.server_close()
