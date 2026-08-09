@@ -190,6 +190,37 @@ into `.cursor/mcp.json`; for Zed, into `settings.json` under `mcp_servers`. It l
 You can also run the server directly with `rec mcp` (stdio transport) if a client prefers a
 raw command.
 
+## Browser UI
+
+`rec web` opens a local browser tab — a read-mostly viewer for sessions you've
+already recorded, plus Start/Stop controls. It's modelled on the qBittorrent /
+Transmission web UI: a loopback HTTP server serves a single-page app that drives
+the **same** session store the CLI uses. The terminal can't show a live capture
+meter, a seekable audio player beside its transcript, or a session list you can
+skim in one glance — the browser can, so the UI exists for exactly those three
+things.
+
+```bash
+rec setup            # one-time, in a terminal (the UI can't grant capture permission)
+rec web              # opens a browser tab at http://127.0.0.1:7717
+```
+
+From the tab you can browse sessions, play and seek the audio next to its
+transcript, search across every transcript, and Start/Stop a recording. Start
+calls the same recorder the CLI does; Stop queues transcription and the page
+polls until the transcript is ready. If no config is found, the Start button
+tells you to run `rec setup` in a terminal first.
+
+The server binds to `127.0.0.1` only — the host is not configurable, by design
+(a local tool must not become an open transcript server). `--port` overrides the
+default port; `--no-open` skips the automatic browser tab.
+
+> **What this is not.** The UI is still **not** a real-time transcription
+> surface — the transcript arrives after Stop, exactly as in the CLI, and there
+> is still no cloud, no sync, and no account. Every action in the browser maps
+> to a command that already exists; if a feature has no CLI equivalent, it is
+> not in the UI.
+
 ## Configuration
 
 Stored at `~/.config/rec/config.json` (XDG). Recordings live under
