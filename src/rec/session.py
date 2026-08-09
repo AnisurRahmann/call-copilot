@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +70,17 @@ STATUS_TRANSCRIBED = "transcribed"
 # skip transcription entirely and mark the session SILENT instead. The WAV
 # stays on disk for `rec diagnose` to inspect.
 STATUS_SILENT = "silent"
+
+# The canonical session id shape: YYYY-MM-DD_HH-MM-SS. Single source of truth
+# for "is this a real session directory" — used by list_sessions to skip stray
+# folders, and by the web router to reject non-conformant ids (path-traversal
+# defense) before they reach session_dir.
+_SESSION_ID_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+
+
+def is_valid_session_id(session_id: str) -> bool:
+    """True if ``session_id`` matches the canonical ``YYYY-MM-DD_HH-MM-SS`` shape."""
+    return bool(_SESSION_ID_PATTERN.match(session_id))
 
 
 def new_session_id(now: datetime | None = None) -> str:
@@ -166,13 +178,22 @@ def update_meta(session_id: str, **changes) -> SessionMeta:
 
 
 def list_sessions() -> list[SessionMeta]:
-    """All sessions newest-first (by id, which sorts chronologically)."""
+    """All sessions newest-first (by id, which sorts chronologically).
+
+    Only directories whose name is a canonical session id
+    (``YYYY-MM-DD_HH-MM-SS``) are returned. Stray directories under the
+    sessions root (test artifacts, manually-created folders) are ignored so
+    they don't surface as unopenable rows in the list/web UI or push real
+    sessions below the fold in the chronological sort.
+    """
     root = config.sessions_root()
     if not root.exists():
         return []
     out: list[SessionMeta] = []
     for child in sorted(root.iterdir(), reverse=True):
         if not child.is_dir():
+            continue
+        if not _SESSION_ID_PATTERN.match(child.name):
             continue
         meta = load_meta(child.name)
         if meta is not None:

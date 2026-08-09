@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import errno
 import json
-import re
 import urllib.parse
 import webbrowser
 from collections.abc import Callable
@@ -30,6 +29,7 @@ from importlib import resources
 
 import click
 
+from .. import session as session_mod
 from ..log import get_logger
 
 log = get_logger(__name__)
@@ -40,7 +40,7 @@ LOOPBACK_HOST = "127.0.0.1"
 # Session ids are always YYYY-MM-DD_HH-MM-SS (see session.new_session_id).
 # Validating every id from a URL against this exact shape blocks path traversal
 # before it reaches session_dir(); reject with 400, never sanitise-and-continue.
-_SESSION_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+# The pattern lives in session.py (single source of truth) and is reused here.
 
 # Map an incoming path to a handler. Static routes are exact; the dynamic
 # session routes carry a <id> placeholder resolved at dispatch time. Populated
@@ -280,7 +280,7 @@ def _route(method: str, path: str) -> tuple[RouteHandler | None, dict[str, str]]
         if not ok:
             continue
         # Validate any captured 'id' (session id) before it reaches a handler.
-        if "id" in params and not _SESSION_ID_RE.match(params["id"]):
+        if "id" in params and not session_mod.is_valid_session_id(params["id"]):
             raise _ApiError(
                 HTTPStatus.BAD_REQUEST, "Invalid session id."
             )

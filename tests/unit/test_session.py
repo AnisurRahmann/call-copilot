@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
 from rec import config, session
@@ -117,3 +118,33 @@ def test_list_sessions_ignores_non_directories(xdg, monkeypatch):
     sessions = session.list_sessions()
     assert len(sessions) == 1
     assert sessions[0].id == "2026-07-27_14-30-00"
+
+
+def test_list_sessions_ignores_stray_non_timestamp_dirs(xdg):
+    """Stray directories with non-conformant names don't surface as sessions.
+
+    Real-world cause: a tap self-test or demo fixture leaves a folder like
+    ``TAPTEST_1785841259`` or ``demo`` under the sessions root. Those sort
+    above real timestamp ids and bury the newest session, and clicking one in
+    the web UI hits the id-format guard. list_sessions filters them out so the
+    list, the CLI, the MCP server, and the web UI all agree.
+    """
+    root = config.sessions_root()
+    root.mkdir(parents=True, exist_ok=True)
+    # Two strays + one real session that should be the only thing returned.
+    for stray in ("TAPTEST_1785841259", "demo"):
+        (root / stray).mkdir()
+        (root / stray / "session.json").write_text(json.dumps({"id": stray}))
+    session.update_meta("2026-08-10_01-42-47", status=session.STATUS_TRANSCRIBED)
+    sessions = session.list_sessions()
+    assert [s.id for s in sessions] == ["2026-08-10_01-42-47"]
+
+
+def test_is_valid_session_id():
+    assert session.is_valid_session_id("2026-08-10_01-42-47")
+    # Rejected: traversal, non-timestamp shapes, empty.
+    assert not session.is_valid_session_id("demo")
+    assert not session.is_valid_session_id("TAPTEST_1785841259")
+    assert not session.is_valid_session_id("../etc/passwd")
+    assert not session.is_valid_session_id("")
+    assert not session.is_valid_session_id("2026-8-10_1-42-47")  # not zero-padded
