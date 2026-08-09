@@ -114,10 +114,12 @@ def test_unknown_path_is_404(web_server):
     assert json.loads(body)["error"]
 
 
-def test_api_routes_absent_until_registered(web_server):
-    """Until T4 registers them, /api/* paths are 404 — not 500 from a bad import."""
+def test_unregistered_api_paths_are_404(web_server):
+    """Routes not yet registered (audio/mutating, added in T5/T7) still 404."""
     host, port = web_server
-    status, body, _ = _get(host, port, "/api/status", headers={"Host": f"127.0.0.1:{port}"})
+    status, body, _ = _get(
+        host, port, "/api/sessions/x/audio/system", headers={"Host": f"127.0.0.1:{port}"}
+    )
     assert status == 404
     assert json.loads(body)["error"]
 
