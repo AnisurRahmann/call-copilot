@@ -62,18 +62,14 @@ def _get(host: str, port: int, path: str, *, headers: dict[str, str] | None = No
 
 
 def test_get_index_serves_html(web_server):
-    """The skeleton serves the SPA. index.html doesn't ship yet (T8), so the
-    handler returns a clean 404 — proving the route resolves and the static
-    loader degrades gracefully rather than throwing."""
+    """GET / serves the single-page app as text/html (package data, T8)."""
     host, port = web_server
-    # index.html is absent until T8; assert the route is matched (not a 404
-    # from routing) by checking we get a JSON error envelope, not a default
-    # HTML error page. Once T8 lands index.html this flips to 200 + text/html.
-    status, body, _ = _get(host, port, "/", headers={"Host": f"127.0.0.1:{port}"})
-    assert status in (200, 404)
-    if status == 404:
-        payload = json.loads(body)
-        assert "error" in payload
+    status, body, hdrs = _get(host, port, "/", headers={"Host": f"127.0.0.1:{port}"})
+    assert status == 200
+    assert hdrs["content-type"].startswith("text/html")
+    assert body[:15].lower() == b"<!doctype html>"
+    # The signature element is present so we know it's our page, not a stub.
+    assert b"capture-strip" in body
 
 
 # ---- DNS-rebinding guard --------------------------------------------------
