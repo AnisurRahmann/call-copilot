@@ -637,7 +637,14 @@ def status() -> None:
     """Show whether a recording is in progress."""
     pid = recorder.active_pid()
     if pid is None:
-        click.echo("Not recording.")
+        # Not capturing — but a transcription may still be running in the
+        # background (web job pool, or a parallel `rec transcribe`). Surface it
+        # so the machine doesn't look idle while Whisper is grinding.
+        transcribing = _transcribing_session()
+        if transcribing is not None:
+            click.echo(f"Transcribing (session {transcribing}).")
+        else:
+            click.echo("Not recording.")
         return
 
     session_id = _current_recording_session_id()
@@ -660,6 +667,20 @@ def status() -> None:
 
     size_str = f"  size: {_format_bytes(size)}" if size is not None else ""
     click.echo(f"Recording (pid {pid}, session {session_id}){elapsed}{size_str}")
+
+
+def _transcribing_session() -> str | None:
+    """Return the id of the session currently being transcribed, if any.
+
+    A session stuck in STATUS_TRANSCRIBING while no recorder is running means
+    a transcription is in flight (web job pool, or `rec transcribe` in another
+    terminal). Used by `rec status` so the user sees that state instead of
+    "Not recording". Newest match wins if there's ever more than one.
+    """
+    for meta in session.list_sessions():
+        if meta.status == session.STATUS_TRANSCRIBING:
+            return meta.id
+    return None
 
 
 def _format_elapsed(started: datetime) -> str:
@@ -989,6 +1010,35 @@ def _transcribe_session(
         # _finish_session already handled the no-WAV case, but guard anyway.
         raise click.ClickException(f"No recording found for session {session_id}.")
 
+    # Mark the session as transcribing BEFORE the (slow) model load + decode so
+    # `rec status` and the web UI show in-flight state. Cleared to a terminal
+    # status below; on error we drop back to RECORDED so the session isn't
+    # stuck "transcribing" forever.
+    session.update_meta(session_id, status=session.STATUS_TRANSCRIBING)
+    try:
+        return _transcribe_session_inner(
+            session_id, model_name, sys_wav, mic_wav, has_sys, has_mic, vad_filter
+        )
+    except Exception:
+        session.update_meta(session_id, status=session.STATUS_RECORDED)
+        raise
+
+
+def _transcribe_session_inner(
+    session_id: str,
+    model_name: str,
+    sys_wav: Path,
+    mic_wav: Path,
+    has_sys: bool,
+    has_mic: bool,
+    vad_filter: bool,
+) -> None:
+    """Run the Whisper transcodes and write the transcript + terminal status.
+
+    Split out of `_transcribe_session` so the caller can bracket it with the
+    STATUS_TRANSCRIBING / error-rollback pair without a deep try/except around
+    the whole body. Assumes STATUS_TRANSCRIBING is already set on the session.
+    """
     def _t(path):
         return transcriber.transcribe(
             path, model_name=model_name, language="en", console=console, vad_filter=vad_filter

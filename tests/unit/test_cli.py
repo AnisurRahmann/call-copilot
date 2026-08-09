@@ -368,6 +368,85 @@ def test_stop_transcribes_and_keeps_no_device_state(monkeypatch, cfg_written, fa
     assert session.transcript_path(sid).exists()
 
 
+def test_transcribe_sets_transcribing_status_mid_call(monkeypatch, cfg_written, fake_audio_levels):
+    """STATUS_TRANSCRIBING is on the session while the model is running.
+
+    The stubbed transcriber inspects meta on entry, before the terminal status
+    is written, so we can prove the in-flight state is observable to anyone
+    reading session.json concurrently (the web UI, or `rec status`).
+    """
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_RECORDING)
+    session.create_session_dir(sid)
+    session.wav_path(sid).write_bytes(b"RIFF...fake")
+
+    monkeypatch.setattr(recorder, "active_pid", lambda: 4321)
+    monkeypatch.setattr(recorder, "stop_recorder", lambda: (True, 4321))
+
+    seen: dict = {}
+
+    def spying_transcribe(wav, model_name="base", language="en", console=None, vad_filter=False):
+        # The recorder has stopped; transcription has started. The session must
+        # be marked transcribing before the first transcribe call returns.
+        meta = session.load_meta(sid)
+        seen["status_during"] = meta.status if meta else None
+        return TranscriptResult(
+            segments=[Segment(0.0, 12.0, "Hello world.")],
+            duration=12.0,
+            language="en",
+            language_probability=0.95,
+        )
+
+    monkeypatch.setattr(cli.transcriber, "transcribe", spying_transcribe)
+
+    res = CliRunner().invoke(cli.cli, ["stop"])
+    assert res.exit_code == 0, res.output
+    assert seen["status_during"] == session.STATUS_TRANSCRIBING
+    # And it clears to the terminal state afterwards.
+    assert session.load_meta(sid).status == session.STATUS_TRANSCRIBED
+
+
+def test_transcribe_rolls_back_to_recorded_on_error(monkeypatch, cfg_written, fake_audio_levels):
+    """A failed transcription must not leave the session stuck in TRANSCRIBING."""
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_RECORDING)
+    session.create_session_dir(sid)
+    session.wav_path(sid).write_bytes(b"RIFF...fake")
+
+    monkeypatch.setattr(recorder, "active_pid", lambda: 4321)
+    monkeypatch.setattr(recorder, "stop_recorder", lambda: (True, 4321))
+
+    def boom(wav, model_name="base", language="en", console=None, vad_filter=False):
+        raise RuntimeError("model load failed")
+
+    monkeypatch.setattr(cli.transcriber, "transcribe", boom)
+
+    res = CliRunner().invoke(cli.cli, ["stop"])
+    # The error propagates out of `main()` as a non-zero exit.
+    assert res.exit_code != 0
+    assert session.load_meta(sid).status == session.STATUS_RECORDED
+
+
+def test_status_reports_transcribing(monkeypatch, xdg):
+    """`rec status` shows in-flight transcription when no recorder is running."""
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_TRANSCRIBING)
+
+    monkeypatch.setattr(recorder, "active_pid", lambda: None)
+    res = CliRunner().invoke(cli.cli, ["status"])
+    assert res.exit_code == 0, res.output
+    assert "Transcribing" in res.output
+    assert sid in res.output
+
+
+def test_status_idle_when_not_recording_or_transcribing(monkeypatch, xdg):
+    monkeypatch.setattr(recorder, "active_pid", lambda: None)
+    res = CliRunner().invoke(cli.cli, ["status"])
+    assert res.exit_code == 0, res.output
+    assert "Not recording" in res.output
+    assert "Transcribing" not in res.output
+
+
 def test_stop_merges_mic_plus_system_transcript(monkeypatch, cfg_written, fake_transcribe, fake_audio_levels):
     """When both recording.wav and recording-mic.wav exist, the merged transcript is built."""
     sid = session.new_session_id()

@@ -58,6 +58,11 @@ def validate_session_id(session_id: str) -> str:
 # Valid lifecycle statuses.
 STATUS_RECORDING = "recording"
 STATUS_RECORDED = "recorded"
+# Transcription is running in the background (web job pool, or inline via the
+# CLI). Set before the model starts, cleared (to TRANSCRIBED/SILENT/RECORDED)
+# when it finishes. Surfaces in `rec status` and the web UI so a second process
+# doesn't think the machine is idle while Whisper is grinding.
+STATUS_TRANSCRIBING = "transcribing"
 STATUS_TRANSCRIBED = "transcribed"
 # A SILENT session captured only zero samples — nothing to transcribe.
 # Whisper on pure silence hallucinates text (e.g. a repeated "You"), so we
