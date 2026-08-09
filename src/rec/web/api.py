@@ -20,6 +20,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 from .. import config, recorder, session
+from .ranges import parse_range
 from .server import _ApiError
 
 if TYPE_CHECKING:
@@ -37,6 +38,7 @@ def register(routes: dict[tuple[str, str], tuple]) -> None:
             ("GET", "/api/status"): (get_status, []),
             ("GET", "/api/sessions"): (get_sessions, []),
             ("GET", "/api/sessions/{id}"): (get_session_detail, ["id"]),
+            ("GET", "/api/sessions/{id}/audio/{stream}"): (get_audio, ["id", "stream"]),
             ("GET", "/api/search"): (get_search, []),
         }
     )
@@ -213,6 +215,80 @@ def get_session_detail(h: WebHandler, id: str) -> None:
             "audio_streams": _audio_streams(id),
         },
     )
+
+
+# ---- GET /api/sessions/{id}/audio/{stream} --------------------------------
+
+
+_AUDIO_KINDS = {"system", "mic"}
+
+
+def get_audio(h: WebHandler, id: str, stream: str) -> None:
+    """Serve a session's WAV, Range-capable so Safari's <audio> plays and seeks.
+
+    ``stream`` is 'system' (recording.wav) or 'mic' (recording-mic.wav). The
+    stdlib handler doesn't implement Range; Safari sends ``bytes=0-1`` first
+    and refuses to play without a correct 206. We hand-roll it with parse_range.
+
+    - single range  → 206 with Content-Range / Accept-Ranges / Content-Length
+    - no Range      → 200 with the full body
+    - multi-range   → 200 full body (multipart/byteranges not implemented)
+    - invalid/OOB   → 416 with Content-Range: bytes */T
+    """
+    if stream not in _AUDIO_KINDS:
+        raise _ApiError(HTTPStatus.NOT_FOUND, f"Unknown audio stream '{stream}'.")
+    path = session.wav_path(id) if stream == "system" else session.mic_wav_path(id)
+    if not path.exists():
+        raise _ApiError(HTTPStatus.NOT_FOUND, f"No {stream} audio for session {id}.")
+
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        raise _ApiError(
+            HTTPStatus.INTERNAL_SERVER_ERROR, f"Could not read audio: {e}."
+        ) from e
+
+    total = len(data)
+    spec = parse_range(h.headers.get("Range"), total)
+
+    if spec.kind == "none":
+        # Full body. Advertise range support so the client knows it can seek.
+        h._send_bytes(
+            HTTPStatus.OK,
+            data,
+            "audio/wav",
+            extra_headers=[("Accept-Ranges", "bytes")],
+        )
+        return
+
+    if spec.kind == "multi":
+        # Fall back to the full body rather than attempting multipart/byteranges.
+        h._send_bytes(
+            HTTPStatus.OK,
+            data,
+            "audio/wav",
+            extra_headers=[("Accept-Ranges", "bytes")],
+        )
+        return
+
+    if spec.kind == "invalid":
+        # Unsatisfiable. Per RFC 7233, include Content-Range: bytes */T.
+        h.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+        h.send_header("Content-Range", f"bytes */{total}")
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+        return
+
+    # Single satisfiable range → 206 Partial Content.
+    chunk = data[spec.start : spec.end + 1]
+    h.send_response(HTTPStatus.PARTIAL_CONTENT)
+    h.send_header("Content-Type", "audio/wav")
+    h.send_header("Content-Length", str(len(chunk)))
+    h.send_header("Content-Range", f"bytes {spec.start}-{spec.end}/{total}")
+    h.send_header("Accept-Ranges", "bytes")
+    h.end_headers()
+    if h.command != "HEAD":
+        h.wfile.write(chunk)
 
 
 # ---- GET /api/search ------------------------------------------------------

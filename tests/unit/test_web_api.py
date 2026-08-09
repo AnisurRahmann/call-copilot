@@ -243,3 +243,136 @@ def test_search_no_matches_returns_guidance_not_error(web_server, xdg):
     assert status == 200  # guidance, not 404
     assert payload["count"] == 0
     assert payload["guidance"]
+
+
+# ---- GET /api/sessions/{id}/audio/{stream} --------------------------------
+# A deterministic payload so byte ranges are checkable. 256 bytes, each byte
+# equal to its offset, so a slice [s:e+1] reads back as range(s, e+1).
+_AUDIO = bytes(range(256))
+
+
+def _make_session_with_audio(system: bool = True, mic: bool = False) -> str:
+    global _seq
+    _seq += 1
+    now = datetime(2025, 1, 1, 9, 0, 0) + timedelta(minutes=_seq)
+    sid = session.new_session_id(now=now)
+    session.update_meta(sid, status=session.STATUS_TRANSCRIBED, duration=10.0, word_count=5)
+    session.create_session_dir(sid)
+    if system:
+        session.wav_path(sid).write_bytes(_AUDIO)
+    if mic:
+        session.mic_wav_path(sid).write_bytes(_AUDIO)
+    return sid
+
+
+def test_audio_no_range_serves_full_body(web_server, xdg):
+    sid = _make_session_with_audio()
+    host, port = web_server
+    status, body, hdrs = _get(host, port, f"/api/sessions/{sid}/audio/system")
+    assert status == 200
+    assert body == _AUDIO
+    assert hdrs["content-type"] == "audio/wav"
+    assert hdrs["accept-ranges"] == "bytes"
+    assert hdrs["content-length"] == "256"
+
+
+def test_audio_single_range_returns_206_with_exact_bytes(web_server, xdg):
+    """The load-bearing case: Safari's bytes=0-1 first probe."""
+    sid = _make_session_with_audio()
+    host, port = web_server
+    status, body, hdrs = _get(
+        host, port, f"/api/sessions/{sid}/audio/system",
+        headers={"Host": f"127.0.0.1:{port}", "Range": "bytes=0-1"},
+    )
+    assert status == 206
+    assert body == _AUDIO[0:2]  # bytes(0..1) == b'\x00\x01'
+    assert hdrs["content-length"] == "2"
+    assert hdrs["content-range"] == "bytes 0-1/256"
+    assert hdrs["accept-ranges"] == "bytes"
+
+
+def test_audio_mid_range(web_server, xdg):
+    sid = _make_session_with_audio()
+    host, port = web_server
+    status, body, hdrs = _get(
+        host, port, f"/api/sessions/{sid}/audio/system",
+        headers={"Host": f"127.0.0.1:{port}", "Range": "bytes=100-199"},
+    )
+    assert status == 206
+    assert body == _AUDIO[100:200]
+    assert hdrs["content-range"] == "bytes 100-199/256"
+    assert hdrs["content-length"] == "100"
+
+
+def test_audio_open_ended_range(web_server, xdg):
+    sid = _make_session_with_audio()
+    host, port = web_server
+    status, body, _ = _get(
+        host, port, f"/api/sessions/{sid}/audio/system",
+        headers={"Host": f"127.0.0.1:{port}", "Range": "bytes=200-"},
+    )
+    assert status == 206
+    assert body == _AUDIO[200:256]
+
+
+def test_audio_suffix_range(web_server, xdg):
+    sid = _make_session_with_audio()
+    host, port = web_server
+    status, body, _ = _get(
+        host, port, f"/api/sessions/{sid}/audio/system",
+        headers={"Host": f"127.0.0.1:{port}", "Range": "bytes=-16"},
+    )
+    assert status == 206
+    assert body == _AUDIO[240:256]
+
+
+def test_audio_multi_range_falls_back_to_full_body(web_server, xdg):
+    """We don't implement multipart/byteranges — fall back to 200 full body."""
+    sid = _make_session_with_audio()
+    host, port = web_server
+    status, body, _ = _get(
+        host, port, f"/api/sessions/{sid}/audio/system",
+        headers={"Host": f"127.0.0.1:{port}", "Range": "bytes=0-9,20-29"},
+    )
+    assert status == 200
+    assert body == _AUDIO
+
+
+def test_audio_out_of_bounds_start_is_416(web_server, xdg):
+    sid = _make_session_with_audio()
+    host, port = web_server
+    status, body, hdrs = _get(
+        host, port, f"/api/sessions/{sid}/audio/system",
+        headers={"Host": f"127.0.0.1:{port}", "Range": "bytes=999-"},
+    )
+    assert status == 416
+    assert hdrs["content-range"] == "bytes */256"
+
+
+def test_audio_unknown_stream_is_404(web_server, xdg):
+    sid = _make_session_with_audio()
+    host, port = web_server
+    status, body, _ = _get(host, port, f"/api/sessions/{sid}/audio/nope")
+    assert status == 404
+    assert json.loads(body)["error"]
+
+
+def test_audio_missing_audio_is_404(web_server, xdg):
+    """A session with no system WAV returns 404, not 500 on read."""
+    sid = _make_session_with_audio(system=False, mic=True)
+    host, port = web_server
+    status, body, _ = _get(host, port, f"/api/sessions/{sid}/audio/system")
+    assert status == 404
+    assert json.loads(body)["error"]
+
+
+def test_audio_mic_stream_served(web_server, xdg):
+    sid = _make_session_with_audio(system=True, mic=True)
+    host, port = web_server
+    status, body, _ = _get(
+        host, port, f"/api/sessions/{sid}/audio/mic",
+        headers={"Host": f"127.0.0.1:{port}", "Range": "bytes=0-15"},
+    )
+    assert status == 206
+    assert body == _AUDIO[0:16]
+
