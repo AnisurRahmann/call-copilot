@@ -498,6 +498,42 @@ def test_get_job_404_for_unknown_id(web_server, xdg):
     assert payload["error"]
 
 
+# ---- GET /api/config ------------------------------------------------------
+
+
+def test_get_config_returns_full_shape(web_server, xdg):
+    _write_config()
+    host, port = web_server
+    status, payload = _json(host, port, "/api/config")
+    assert status == 200
+    assert payload["config_present"] is True
+    # The five RecConfig keys, JSON-safe.
+    cfg = payload["config"]
+    for key in ("sample_rate", "channels", "whisper_model", "capture", "sessions_dir"):
+        assert key in cfg, f"missing config key {key}"
+    # Resolved paths + version + env probes.
+    assert payload["version"]
+    assert payload["config_path"]
+    assert payload["sessions_root"]
+    assert payload["index_db"]
+    assert "macos_version" in payload
+    assert "audiotap_usable" in payload
+    # setup_hint is None when config exists.
+    assert payload["setup_hint"] is None
+
+
+def test_get_config_without_config_is_not_500(web_server, xdg):
+    """No config.json -> 200 with config_present:false + a setup hint."""
+    host, port = web_server
+    status, payload = _json(host, port, "/api/config")
+    assert status == 200  # not 500
+    assert payload["config_present"] is False
+    assert payload["setup_hint"]
+    assert "rec setup" in payload["setup_hint"].lower()
+    # Still returns default-valued config so the UI can render the table.
+    assert payload["config"]["whisper_model"]
+
+
 # retranscribe -------------------------------------------------------------
 
 

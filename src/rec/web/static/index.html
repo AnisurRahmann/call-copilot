@@ -5,79 +5,139 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Call Copilot</title>
 <style>
-  /* ---- token system ----------------------------------------------------
-     Palette derived from audio-metering vernacular (VU meters, scope phosphor,
-     pro-audio signal LEDs) — not a generic dashboard. One accent (--signal)
-     carries live capture only; every other state is typographic.
-     Deliberately NOT: cream+serif+terracotta, near-black+acid-green, or
-     broadsheet columns. */
+  /* ===================================================================
+     tokens — single source of truth. No literal hex or magic px outside
+     this block. Palette derived from audio-metering vernacular; the accent
+     (--signal) is reserved for LIVE capture only, everything else is
+     greyscale + type weight.
+     =================================================================== */
   :root {
-    --ink:    #0e1116;  /* panel ground */
-    --paper:  #161b22;  /* lifted surface */
-    --rule:   #2a3038;  /* hairline rules */
-    --text:   #c9d1d9;  /* primary text */
-    --mute:   #6e7681;  /* secondary: ids, timestamps, mute labels */
-    --signal: #3fb950;  /* the ONE accent — live capture only */
-    --amber:  #d29922;  /* reserved: the silent-session diagnostic hint */
+    --ink:    #0e1116;
+    --paper:  #161b22;
+    --rule:   #2a3038;
+    --text:   #c9d1d9;
+    --mute:   #6e7681;
+    --signal: #3fb950;
+    --amber:  #d29922;
+
+    --shell-w: 152px;
+    --rack:    1100px;
+    --pad:    20px;
+    --pad-sm: 14px;
+    --gap:    12px;
+
+    --fs-body: 14px;
+    --fs-sm:   13px;
+    --fs-xs:   12px;
+    --fs-xxs:  11px;
+
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   }
 
   *, *::before, *::after { box-sizing: border-box; }
-
   html, body { margin: 0; padding: 0; background: var(--ink); color: var(--text); }
-  body { font-family: var(--sans); font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+  body { font-family: var(--sans); font-size: var(--fs-body); line-height: 1.5; -webkit-font-smoothing: antialiased; }
   a { color: var(--text); }
+  code { font-family: var(--mono); }
 
-  /* ---- header + capture strip ----------------------------------------- */
-  header {
-    position: sticky; top: 0; z-index: 10;
+  /* ===================================================================
+     shell — the persistent chrome. Capture bar pinned across the top;
+     sidebar nav fixed on the left; main region holds the routed view.
+     =================================================================== */
+  .shell { display: flex; min-height: 100vh; }
+
+  /* ---- capture bar (always mounted, global recording state) --------- */
+  .capturebar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 20;
     background: var(--ink);
     border-bottom: 1px solid var(--rule);
   }
-  .hdr-row {
-    max-width: 1100px; margin: 0 auto;
-    padding: 10px 20px;
-    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  .capturebar .row {
+    max-width: var(--rack); margin: 0 auto;
+    padding: 10px var(--pad);
+    display: flex; align-items: center; gap: var(--gap); flex-wrap: wrap;
   }
   .brand {
     font-family: var(--mono); font-weight: 600; letter-spacing: 0.02em;
     color: var(--text); text-decoration: none; margin-right: 8px;
+    display: inline-flex; align-items: baseline; gap: 6px;
   }
-  .brand .dot { color: var(--signal); }
+  .brand .dot {
+    color: var(--mute);              /* idle: dimmed hollow mark */
+    font-size: var(--fs-xs);
+  }
+  .brand.live .dot { color: var(--signal); }   /* recording/transcribing only */
   .state {
-    font-family: var(--mono); font-size: 12px; color: var(--mute);
+    font-family: var(--mono); font-size: var(--fs-xs); color: var(--mute);
     text-transform: lowercase; letter-spacing: 0.04em;
   }
   .state.live { color: var(--signal); }
   .state .meta { color: var(--mute); margin-left: 8px; }
-  .hdr-spacer { flex: 1 1 auto; }
+  .capturebar .spacer { flex: 1 1 auto; }
+  #controls { display: flex; gap: var(--gap); align-items: center; }
 
   /* the signature element: live capture strip */
   .capture-strip {
-    height: 3px; width: 100%;
-    background: var(--rule);
+    height: 3px; width: 100%; background: var(--rule);
     position: relative; overflow: hidden;
   }
   .capture-strip .fill {
-    position: absolute; inset: 0 auto 0 0;
-    width: 0%;
-    background: var(--signal);
-    transition: width 0.25s linear;
+    position: absolute; inset: 0 auto 0 0; width: 0%;
+    background: var(--signal); transition: width 0.25s linear;
   }
   .capture-strip.idle { display: none; }
-  /* reduced motion: the strip becomes a steady fill, no width animation */
   @media (prefers-reduced-motion: reduce) {
     .capture-strip .fill { transition: none; }
   }
 
-  /* ---- controls ------------------------------------------------------- */
+  /* ---- sidebar nav (extension point) -------------------------------- */
+  .nav {
+    position: fixed; top: 49px; bottom: 0; left: 0; width: var(--shell-w);
+    background: var(--ink); border-right: 1px solid var(--rule);
+    display: flex; flex-direction: column; padding: var(--pad) 0;
+  }
+  .nav a {
+    display: block; padding: 7px var(--pad);
+    font-family: var(--mono); font-size: var(--fs-xs);
+    text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--mute); text-decoration: none;
+  }
+  .nav a:hover { color: var(--text); background: var(--paper); }
+  .nav a[aria-current="page"] { color: var(--text); border-left: 2px solid var(--text); padding-left: calc(var(--pad) - 2px); }
+  .nav .foot { margin-top: auto; padding: 0 var(--pad); font-family: var(--mono); font-size: var(--fs-xxs); color: var(--mute); }
+
+  /* ---- main region (routed views render here) ----------------------- */
+  main {
+    margin-left: var(--shell-w);
+    margin-top: 49px;            /* clear the fixed capture bar */
+    padding: var(--pad) var(--pad) 80px;
+    max-width: var(--rack);
+  }
+
+  /* ---- responsive: nav collapses to a row below 700px -------------- */
+  @media (max-width: 700px) {
+    .nav {
+      position: static; width: auto; flex-direction: row;
+      border-right: none; border-bottom: 1px solid var(--rule);
+      padding: 0 var(--pad-sm); overflow-x: auto;
+    }
+    .nav a { padding: 8px var(--gap); border-left: none !important; }
+    .nav a[aria-current="page"] { border-bottom: 2px solid var(--text); padding-left: var(--gap); }
+    .nav .foot { display: none; }
+    .shell { flex-direction: column; }
+    main { margin-left: 0; padding: var(--pad-sm) var(--pad-sm) 60px; }
+    .capturebar .row { padding: 10px var(--pad-sm); }
+  }
+
+  /* ===================================================================
+     controls — buttons/selects. Instrument-panel look: no radius.
+     =================================================================== */
   button, select {
-    font-family: var(--mono); font-size: 12px;
+    font-family: var(--mono); font-size: var(--fs-xs);
     background: var(--paper); color: var(--text);
-    border: 1px solid var(--rule);
-    padding: 6px 12px; cursor: pointer;
-    border-radius: 0; /* instrument panel, not a SaaS pill */
+    border: 1px solid var(--rule); padding: 6px 12px; cursor: pointer;
+    border-radius: 0;
   }
   button:hover { border-color: var(--mute); }
   button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible {
@@ -86,26 +146,21 @@
   button.primary { border-color: var(--signal); color: var(--signal); }
   button:disabled { opacity: 0.4; cursor: default; }
   select { padding: 5px 8px; }
-
-  /* ---- layout --------------------------------------------------------- */
-  main { max-width: 1100px; margin: 0 auto; padding: 24px 20px 80px; }
-
-  /* ---- list view ------------------------------------------------------ */
-  .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
   input[type="search"] {
-    flex: 1 1 280px; min-width: 0;
-    font-family: var(--mono); font-size: 13px;
+    font-family: var(--mono); font-size: var(--fs-sm);
     background: var(--paper); color: var(--text);
     border: 1px solid var(--rule); padding: 7px 10px; border-radius: 0;
   }
   input[type="search"]::placeholder { color: var(--mute); }
 
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  /* ===================================================================
+     tables — dense, hairline-ruled. No cards, no shadows.
+     =================================================================== */
+  table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
   thead th {
     text-align: left; font-family: var(--mono); font-weight: 500;
-    color: var(--mute); font-size: 11px; text-transform: uppercase;
-    letter-spacing: 0.06em; padding: 6px 10px;
-    border-bottom: 1px solid var(--rule);
+    color: var(--mute); font-size: var(--fs-xxs); text-transform: uppercase;
+    letter-spacing: 0.06em; padding: 6px 10px; border-bottom: 1px solid var(--rule);
   }
   tbody td { padding: 9px 10px; border-bottom: 1px solid var(--rule); }
   tbody tr { cursor: pointer; }
@@ -113,87 +168,102 @@
   td.mono, th.mono { font-family: var(--mono); }
   td.mute, .mute { color: var(--mute); }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  .status-tag { font-family: var(--mono); font-size: 11px; text-transform: lowercase; }
-  .status-tag[data-status="recording"]    { color: var(--signal); }
-  .status-tag[data-status="transcribing"] { color: var(--signal); }
-  .status-tag[data-status="silent"]       { color: var(--amber); }
 
+  /* status weight: transcribed (boring success) recedes; recorded/silent
+     carry more prominence. Typographic, not colour chips. */
+  .status-tag { font-family: var(--mono); font-size: var(--fs-xxs); text-transform: lowercase; color: var(--mute); }
+  .status-tag[data-status="recorded"]  { color: var(--text); font-weight: 500; }
+  .status-tag[data-status="silent"]    { color: var(--amber); font-weight: 500; }
+  .status-tag[data-status="recording"],
+  .status-tag[data-status="transcribing"] { color: var(--signal); }
+  .status-tag .low { color: var(--mute); margin-left: 6px; font-size: var(--fs-xxs); }
+
+  /* ===================================================================
+     views — shared primitives each view may use.
+     =================================================================== */
   .empty {
-    padding: 48px 12px; text-align: center; color: var(--mute);
-    font-family: var(--mono); font-size: 13px;
+    padding: 48px var(--pad-sm); text-align: center; color: var(--mute);
+    font-family: var(--mono); font-size: var(--fs-sm);
   }
   .empty strong { color: var(--text); display: block; margin-bottom: 6px; font-weight: 600; }
 
-  /* search results */
-  .hit { padding: 12px 10px; border-bottom: 1px solid var(--rule); cursor: pointer; }
-  .hit:hover { background: var(--paper); }
-  .hit .ctx { font-family: var(--mono); font-size: 11px; color: var(--mute); margin-bottom: 3px; }
-  .hit .line { color: var(--text); }
-  .hit mark { background: transparent; color: var(--signal); }
-
-  /* ---- detail view ---------------------------------------------------- */
-  .back { font-family: var(--mono); font-size: 12px; color: var(--mute); text-decoration: none; }
+  .back { font-family: var(--mono); font-size: var(--fs-xs); color: var(--mute); text-decoration: none; }
   .back:hover { color: var(--text); }
-  .detail-meta { font-family: var(--mono); font-size: 12px; color: var(--mute); margin: 8px 0 20px; }
-  .detail-meta strong { color: var(--text); font-weight: 500; }
-
-  .streams { display: flex; flex-direction: column; gap: 10px; margin-bottom: 28px; }
-  .stream { display: flex; align-items: center; gap: 12px; }
-  .stream label { font-family: var(--mono); font-size: 11px; color: var(--mute); width: 52px; text-transform: uppercase; letter-spacing: 0.05em; }
-  audio { flex: 1; height: 34px; }
-
-  .transcript-actions { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
-
-  .transcript { font-family: var(--sans); font-size: 15px; line-height: 1.65; max-width: 760px; }
-  .transcript h1, .transcript h2, .transcript h3 { font-family: var(--mono); font-size: 14px; color: var(--text); margin: 1.4em 0 0.5em; }
-  .transcript p { margin: 0 0 0.9em; }
-  .transcript .ts-line { display: flex; gap: 14px; margin: 0 0 0.6em; }
-  .transcript .ts-line time { font-family: var(--mono); color: var(--mute); flex: 0 0 auto; min-width: 56px; }
-  .transcript .ts-line .speaker { color: var(--mute); font-family: var(--mono); font-size: 12px; }
-  .transcript .ts-line .words { flex: 1; }
 
   .hint {
     border-left: 2px solid var(--amber); padding: 10px 14px;
-    color: var(--text); font-size: 13px; margin: 16px 0;
-    background: var(--paper);
+    color: var(--text); font-size: var(--fs-sm); margin: 16px 0; background: var(--paper);
   }
 
-  /* responsive down to a phone */
-  @media (max-width: 560px) {
-    .hdr-row { padding: 10px 14px; gap: 10px; }
-    main { padding: 16px 14px 60px; }
-    table { font-size: 12px; }
-    th.col-words, td.col-words { display: none; } /* keep the essential columns at 380px */
-    .transcript { font-size: 14px; }
-  }
+  /* sessions: list */
+  .toolbar { display: flex; gap: var(--gap); align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  .toolbar input[type="search"] { flex: 1 1 280px; min-width: 0; }
+
+  /* sessions: search hits */
+  .hit { padding: 12px 10px; border-bottom: 1px solid var(--rule); cursor: pointer; }
+  .hit:hover { background: var(--paper); }
+  .hit .ctx { font-family: var(--mono); font-size: var(--fs-xxs); color: var(--mute); margin-bottom: 3px; }
+  .hit .line { color: var(--text); }
+
+  /* sessions: detail */
+  .detail-meta { font-family: var(--mono); font-size: var(--fs-xs); color: var(--mute); margin: 8px 0 20px; }
+  .detail-meta strong { color: var(--text); font-weight: 500; }
+  .streams { display: flex; flex-direction: column; gap: 10px; margin-bottom: 28px; }
+  .stream { display: flex; align-items: center; gap: var(--gap); }
+  .stream label { font-family: var(--mono); font-size: var(--fs-xxs); color: var(--mute); width: 52px; text-transform: uppercase; letter-spacing: 0.05em; }
+  audio { flex: 1; height: 34px; }
+  .transcript-actions { display: flex; gap: var(--gap); align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .transcript { font-family: var(--sans); font-size: 15px; line-height: 1.65; max-width: 760px; }
+  .transcript h1, .transcript h2, .transcript h3 { font-family: var(--mono); font-size: var(--fs-body); color: var(--text); margin: 1.4em 0 0.5em; }
+  .transcript p { margin: 0 0 0.9em; }
+  .transcript .ts-line { display: flex; gap: 14px; margin: 0 0 0.6em; }
+  .transcript .ts-line time { font-family: var(--mono); color: var(--mute); flex: 0 0 auto; min-width: 56px; }
+  .transcript .ts-line .speaker { color: var(--mute); font-family: var(--mono); font-size: var(--fs-xs); }
+  .transcript .ts-line .words { flex: 1; }
+
+  /* settings: definition table */
+  .def th { width: 1%; white-space: nowrap; color: var(--mute); font-weight: 400; }
+  .def td { font-family: var(--mono); }
+  .def td.bool-yes { color: var(--signal); }
+  .def td.bool-no  { color: var(--amber); }
 </style>
 </head>
 <body>
-<header>
-  <div class="hdr-row">
-    <a class="brand" href="#/"><span class="dot">●</span> rec</a>
+
+<!-- ===== capture bar (global, never unmounts) ===== -->
+<div class="capturebar">
+  <div class="row">
+    <a class="brand" href="#/sessions"><span class="dot">●</span> rec</a>
     <span id="state" class="state" aria-live="polite">not recording</span>
-    <span class="hdr-spacer"></span>
+    <span class="spacer"></span>
     <div id="controls"></div>
   </div>
   <div id="captureStrip" class="capture-strip idle" aria-hidden="true">
     <div class="fill" id="captureFill"></div>
   </div>
-</header>
+</div>
 
-<main id="view"></main>
+<div class="shell">
+  <!-- ===== sidebar nav (extension point) ===== -->
+  <nav class="nav" id="nav" aria-label="views"></nav>
+
+  <!-- ===== routed views render here ===== -->
+  <main id="view"></main>
+</div>
 
 <script>
 "use strict";
-/* ---- tiny helpers ---------------------------------------------------- */
+
+/* =======================================================================
+   helpers
+   ======================================================================= */
 const $ = (sel, root = document) => root.querySelector(sel);
-const view = () => $("#view");
+const viewEl = () => $("#view");
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) =>
+  ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
 const fmtBytes = (n) => {
   if (n == null) return "—";
-  for (const u of ["B", "KB", "MB", "GB"]) {
-    if (n < 1024) return `${Math.round(n)} ${u}`;
-    n /= 1024;
-  }
+  for (const u of ["B","KB","MB","GB"]) { if (n < 1024) return `${Math.round(n)} ${u}`; n /= 1024; }
   return `${n.toFixed(1)} TB`;
 };
 const fmtClock = (s) => {
@@ -203,339 +273,337 @@ const fmtClock = (s) => {
   return m >= 60 ? `${Math.floor(m/60)}:${String(m%60).padStart(2,"0")}:${String(r).padStart(2,"0")}`
                  : `${m}:${String(r).padStart(2,"0")}`;
 };
-const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) =>
-  ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
-
 async function api(path, opts) {
-  // Every mutating request carries a custom header. It's a CSRF guard: custom
-  // headers force a CORS preflight, which this server doesn't grant, so a
-  // cross-origin page can't POST to our loopback URL. Same-origin (this SPA)
-  // passes the check. See server._csrf_ok.
+  // Every POST carries X-Requested-With — the CSRF guard (custom header
+  // forces a CORS preflight this server doesn't grant).
   if (opts && opts.method === "POST") {
-    opts = Object.assign({}, opts, {
-      headers: Object.assign({ "X-Requested-With": "rec-web" }, opts.headers || {})
-    });
+    opts = Object.assign({}, opts, { headers: Object.assign({ "X-Requested-With": "rec-web" }, opts.headers || {}) });
   }
   const res = await fetch(path, opts);
-  let body = null;
-  const txt = await res.text();
+  let body = null; const txt = await res.text();
   if (txt) { try { body = JSON.parse(txt); } catch { body = { error: txt }; } }
   if (!res.ok) throw new Error((body && body.error) || `${res.status} ${res.statusText}`);
   return body;
 }
+function errHtml(e) { return `<div class="empty"><strong>${escapeHtml(e.message)}</strong>Try again in a moment.</div>`; }
 
-/* ---- header / status polling ----------------------------------------- */
-let pollMs = 5000;
-let pollTimer = null;
-let prevBytes = null;
-let prevTime = null;
+/* =======================================================================
+   capture bar — polls /api/status on its own interval. Always mounted.
+   ======================================================================= */
+const capture = {
+  timer: null, ms: 5000, prevBytes: null, prevTime: null,
+};
 
 async function refreshStatus() {
-  let st;
-  try { st = await api("/api/status"); }
-  catch (e) { setState(`error: ${e.message}`, false); return; }
+  let st; try { st = await api("/api/status"); }
+  catch (e) { setState(`error: ${e.message}`, false); return captureSchedule(); }
 
+  const brand = $(".brand");
   if (st.recording) {
-    const rate = byteRate(st.bytes);
+    const rate = captureByteRate(st.bytes);
     setState(
       `<span class="meta">${escapeHtml(st.session_id || "")}</span>` +
       `<span class="meta">${fmtClock(st.elapsed_s)}</span>` +
-      `<span class="meta">${fmtBytes(st.bytes)}</span>`,
-      true
-    );
-    showCaptureStrip(rate);
-    renderStartControls({ recording: true });
-    pollMs = 1000;
-  } else if (st.session_id /* transcribing */) {
+      `<span class="meta">${fmtBytes(st.bytes)}</span>`, true);
+    showStrip(rate); renderControls({ recording: true }); brand.classList.add("live");
+    capture.ms = 1000;
+  } else if (st.session_id) {  // transcribing
     setState(`transcribing <span class="meta">${escapeHtml(st.session_id)}</span>`, true);
-    hideCaptureStrip();
-    renderStartControls({ recording: false });
-    pollMs = 1000;
+    hideStrip(); renderControls({ recording: false }); brand.classList.add("live");
+    capture.ms = 1000;
   } else {
     setState("not recording", false);
-    hideCaptureStrip();
-    renderStartControls({ recording: false });
-    pollMs = 5000;
+    hideStrip(); renderControls({ recording: false }); brand.classList.remove("live");
+    capture.ms = 5000;
   }
-  schedulePoll();
+  captureSchedule();
 }
-
-function byteRate(bytes) {
+function captureByteRate(bytes) {
   const now = performance.now();
-  if (prevBytes != null && prevTime != null && bytes != null) {
-    const dt = (now - prevTime) / 1000;
-    if (dt > 0.15) return Math.max(0, (bytes - prevBytes) / dt);
+  if (capture.prevBytes != null && capture.prevTime != null && bytes != null) {
+    const dt = (now - capture.prevTime) / 1000;
+    if (dt > 0.15) return Math.max(0, (bytes - capture.prevBytes) / dt);
   }
-  prevBytes = bytes; prevTime = now;
-  return 0;
+  capture.prevBytes = bytes; capture.prevTime = now; return 0;
 }
-
-function schedulePoll() {
-  if (pollTimer) clearTimeout(pollTimer);
-  pollTimer = setTimeout(refreshStatus, pollMs);
+function captureSchedule() { if (capture.timer) clearTimeout(capture.timer); capture.timer = setTimeout(refreshStatus, capture.ms); }
+function setState(html, live) { const el = $("#state"); el.innerHTML = html; el.classList.toggle("live", !!live); }
+function showStrip(bps) {
+  $("#captureStrip").classList.remove("idle");
+  $("#captureFill").style.width = Math.min(100, Math.round((bps / 350000) * 100)) + "%";
 }
-
-function setState(html, live) {
-  const el = $("#state");
-  el.innerHTML = html;
-  el.classList.toggle("live", !!live);
+function hideStrip() {
+  $("#captureStrip").classList.add("idle"); $("#captureFill").style.width = "0%";
+  capture.prevBytes = null; capture.prevTime = null;
 }
-function showCaptureStrip(bytesPerSec) {
-  const strip = $("#captureStrip");
-  strip.classList.remove("idle");
-  // Map a 0–350 KB/s range onto 0–100% width. Speech audio (~16kHz mono) sits
-  // around 32–64 KB/s; the strip stays modest in normal use and climbs on loud/
-  // dense audio. This is the one thing a terminal can't show — it's the shot.
-  const pct = Math.min(100, Math.round((bytesPerSec / 350000) * 100));
-  $("#captureFill").style.width = pct + "%";
-}
-function hideCaptureStrip() {
-  $("#captureStrip").classList.add("idle");
-  $("#captureFill").style.width = "0%";
-  prevBytes = null; prevTime = null;
-}
-
-/* ---- header controls (start/stop) ------------------------------------ */
-function renderStartControls({ recording }) {
+function renderControls({ recording }) {
   const c = $("#controls");
   if (recording) {
     c.innerHTML = `<button id="stopBtn" class="primary">Stop recording</button>`;
     $("#stopBtn").onclick = onStop;
   } else {
-    c.innerHTML = `
-      <select id="captureSel" aria-label="capture mode">
-        <option value="mic+system">mic + system</option>
-        <option value="mic">mic</option>
-        <option value="system">system</option>
-      </select>
-      <button id="startBtn" class="primary">Start recording</button>`;
+    c.innerHTML = `<select id="captureSel" aria-label="capture mode">
+        <option value="mic+system">mic + system</option><option value="mic">mic</option><option value="system">system</option>
+      </select><button id="startBtn" class="primary">Start recording</button>`;
     $("#startBtn").onclick = onStart;
   }
 }
-
 async function onStart() {
-  const capture = $("#captureSel") ? $("#captureSel").value : "mic+system";
-  try {
-    await api("/api/recording/start", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ capture })
-    });
-    prevBytes = null; prevTime = null;
-    refreshStatus();
-  } catch (e) { alert(e.message); }
+  const capture_v = $("#captureSel") ? $("#captureSel").value : "mic+system";
+  try { await api("/api/recording/start", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ capture: capture_v }) }); capture.prevBytes=null; capture.prevTime=null; refreshStatus(); }
+  catch (e) { alert(e.message); }
 }
 async function onStop() {
-  try {
-    const r = await api("/api/recording/stop", { method: "POST" });
-    refreshStatus();
-    pollJob(r.job_id, r.session_id);
-  } catch (e) { alert(e.message); }
+  try { const r = await api("/api/recording/stop", { method:"POST" }); refreshStatus(); pollJob(r.job_id, r.session_id); }
+  catch (e) { alert(e.message); }
 }
-
-/* ---- job polling ----------------------------------------------------- */
 async function pollJob(jobId, sessionId, doneCb) {
   try {
     const job = await api(`/api/jobs/${jobId}`);
-    if (job.state === "done") {
-      refreshStatus();
-      if (doneCb) doneCb();
-      return;
-    }
-    if (job.state === "error") {
-      alert(job.message || "Transcription failed.");
-      refreshStatus();
-      return;
-    }
-    pollMs = 1000; schedulePoll();
+    if (job.state === "done") { refreshStatus(); if (doneCb) doneCb(); return; }
+    if (job.state === "error") { alert(job.message || "Transcription failed."); refreshStatus(); return; }
+    capture.ms = 1000; captureSchedule();
     setTimeout(() => pollJob(jobId, sessionId, doneCb), 1000);
   } catch { setTimeout(() => pollJob(jobId, sessionId, doneCb), 2000); }
 }
 
-/* ---- router ---------------------------------------------------------- */
-function route() {
-  const hash = location.hash || "#/";
-  if (hash.startsWith("#/s/")) return showDetail(decodeURIComponent(hash.slice(4)));
-  showList();
+/* =======================================================================
+   router + view registry
+   Adding a view = one entry here + one mount() + one route below.
+   The shell owns every setInterval; views declare poll and the shell
+   drives/clears it so navigation never leaks timers.
+   ======================================================================= */
+const VIEWS = {};  // populated below by each view: { label, mount, unmount, poll }
+
+const router = {
+  current: null,      // name of the mounted view
+  pollTimer: null,
+};
+
+function parseHash() {
+  let h = location.hash || "#/sessions";
+  if (h === "#" || h === "#/") h = "#/sessions";
+  // #/sessions, #/sessions/<id>, #/settings — otherwise redirect.
+  if (h.startsWith("#/sessions") || h.startsWith("#/settings")) return h.slice(1);  // leading '/'
+  return "/sessions";
 }
+function route() {
+  const path = parseHash();
+  // mark the active nav link
+  $("#nav").querySelectorAll("a").forEach(a => {
+    a.setAttribute("aria-current", a.getAttribute("data-route") === path.split("/")[1] ? "page" : null);
+  });
+  // unmount the previous view (clears its timers/listeners)
+  if (router.current && VIEWS[router.current] && VIEWS[router.current].unmount) VIEWS[router.current].unmount();
+  if (router.pollTimer) { clearInterval(router.pollTimer); router.pollTimer = null; }
+
+  let name, params;
+  if (path.startsWith("/sessions/")) { name = "sessions"; params = { id: decodeURIComponent(path.slice("/sessions/".length)) }; }
+  else if (path.startsWith("/sessions")) { name = "sessions"; params = {}; }
+  else if (path.startsWith("/settings")) { name = "settings"; params = {}; }
+  else { name = "sessions"; params = {}; }
+
+  router.current = name;
+  viewEl().innerHTML = "";  // hand the view a clean container
+  const v = VIEWS[name];
+  v.mount(viewEl(), params);
+  if (v.poll) router.pollTimer = setInterval(() => v.mount(viewEl(), params, true), v.poll);
+}
+function go(hash) { if (location.hash !== hash) location.hash = hash; else route(); }
 window.addEventListener("hashchange", route);
 
-/* ---- list view ------------------------------------------------------- */
-async function showList() {
-  view().innerHTML = `
-    <div class="toolbar">
-      <input type="search" id="searchBox" placeholder="search transcripts…" autocomplete="off">
-    </div>
-    <div id="listBody"><div class="empty">Loading…</div></div>`;
-  const box = $("#searchBox");
-  let qTimer = null;
-  box.oninput = () => {
-    if (qTimer) clearTimeout(qTimer);
-    const q = box.value.trim();
-    qTimer = setTimeout(() => q ? runSearch(q) : loadList(), 200);
-  };
-  loadList();
+/* =======================================================================
+   sessions view — list, search, detail. Ported unchanged in appearance;
+   adds session-health (wpm) marking and status weight.
+   ======================================================================= */
+const sessionsView = {
+  timer: null, qTimer: null,
+  label: "Sessions",
+  poll: null,
+  mount(container, params, isPoll) {
+    if (params.id) return sessionsDetail(container, params.id);
+    sessionsList(container, isPoll);
+  },
+  unmount() { if (this.qTimer) clearTimeout(this.qTimer); },
+};
+VIEWS.sessions = sessionsView;
+
+// ---- session-health rule: flag low wpm as a likely failed capture ----
+// duration > 30s AND word_count known AND words_per_minute < 20.
+function isLowQuality(s) {
+  if (s.duration == null || s.word_count == null) return false;
+  if (s.duration <= 30) return false;
+  const wpm = s.word_count / (s.duration / 60);
+  return wpm < 20;
 }
 
-async function loadList() {
-  const body = $("#listBody");
+function sessionsList(container, isPoll) {
+  if (!isPoll) {
+    container.innerHTML = `<div class="toolbar"><input type="search" id="searchBox" placeholder="search transcripts…" autocomplete="off"></div><div id="listBody"><div class="empty">Loading…</div></div>`;
+    const box = $("#searchBox");
+    box.oninput = () => {
+      if (sessionsView.qTimer) clearTimeout(sessionsView.qTimer);
+      const q = box.value.trim();
+      sessionsView.qTimer = setTimeout(() => q ? runSearch($("#listBody"), q) : loadList($("#listBody")), 200);
+    };
+  }
+  loadList($("#listBody"));
+}
+
+async function loadList(body) {
   try {
     const { sessions } = await api("/api/sessions?limit=100");
-    if (!sessions.length) {
-      body.innerHTML = `<div class="empty"><strong>No sessions yet.</strong>Press Start recording in the header to capture a meeting.</div>`;
-      return;
-    }
-    body.innerHTML = `
-      <table>
-        <thead><tr>
-          <th>started</th><th>dur</th><th class="col-words">words</th><th>status</th><th class="col-words">model</th>
-        </tr></thead>
-        <tbody>${sessions.map(rowHtml).join("")}</tbody>
-      </table>`;
-    body.querySelectorAll("tbody tr").forEach(tr =>
-      tr.onclick = () => { location.hash = `#/s/${tr.dataset.id}`; });
+    if (!sessions.length) { body.innerHTML = `<div class="empty"><strong>No sessions yet.</strong>Press Start recording in the header to capture a meeting.</div>`; return; }
+    body.innerHTML = `<table><thead><tr><th>started</th><th>dur</th><th class="col-words">words</th><th>status</th><th class="col-words">model</th></tr></thead><tbody>${sessions.map(rowHtml).join("")}</tbody></table>`;
+    body.querySelectorAll("tbody tr").forEach(tr => {
+      tr.onclick = () => go(`#/sessions/${tr.dataset.id}`);
+      tr.onkeydown = (e) => { if (e.key === "Enter") go(`#/sessions/${tr.dataset.id}`); };
+    });
   } catch (e) { body.innerHTML = errHtml(e); }
 }
-
 function rowHtml(s) {
-  const started = s.started_at ? s.started_at.replace("T", " ").slice(5) : "—";
-  return `<tr data-id="${escapeHtml(s.id)}">
+  const started = s.started_at ? s.started_at.replace("T"," ").slice(5) : "—";
+  const low = isLowQuality(s) ? `<span class="low">low</span>` : "";
+  return `<tr data-id="${escapeHtml(s.id)}" tabindex="0">
     <td class="mono">${escapeHtml(started)}</td>
     <td class="mono mute">${escapeHtml(s.duration_human || "—")}</td>
     <td class="mono num col-words">${s.word_count != null ? s.word_count.toLocaleString() : "—"}</td>
-    <td><span class="status-tag" data-status="${escapeHtml(s.status)}">${escapeHtml(s.status)}</span></td>
-    <td class="mono mute col-words">${escapeHtml(s.model || "—")}</td>
-  </tr>`;
+    <td><span class="status-tag" data-status="${escapeHtml(s.status)}">${escapeHtml(s.status)}${low}</span></td>
+    <td class="mono mute col-words">${escapeHtml(s.model || "—")}</td></tr>`;
 }
-
-async function runSearch(q) {
-  const body = $("#listBody");
+async function runSearch(body, q) {
   body.innerHTML = `<div class="empty">Searching…</div>`;
   try {
     const { hits } = await api("/api/search?q=" + encodeURIComponent(q));
-    if (!hits || !hits.length) {
-      body.innerHTML = `<div class="empty"><strong>No matches.</strong>Try different keywords, or clear the search to browse sessions.</div>`;
-      return;
-    }
-    body.innerHTML = `<div>${hits.map(hitHtml).join("")}</div>` +
-      `<p class="mute" style="font-family:var(--mono);font-size:12px;padding:10px;"><a href="#/" class="back">← back to list</a></p>`;
-    body.querySelectorAll(".hit").forEach(el =>
-      el.onclick = () => { location.hash = `#/s/${el.dataset.id}`; });
+    if (!hits || !hits.length) { body.innerHTML = `<div class="empty"><strong>No matches.</strong>Try different keywords, or clear the search to browse sessions.</div>`; return; }
+    body.innerHTML = `<div>${hits.map(hitHtml).join("")}</div><p class="mute" style="font-family:var(--mono);font-size:var(--fs-xs);padding:10px;"><a href="#/sessions" class="back">← back to list</a></p>`;
+    body.querySelectorAll(".hit").forEach(el => { el.onclick = () => go(`#/sessions/${el.dataset.id}`); });
   } catch (e) { body.innerHTML = errHtml(e); }
 }
-
 function hitHtml(h) {
-  const when = h.started_at ? h.started_at.replace("T", " ").slice(5) : h.session_id.slice(5);
-  const offset = h.offset_label ? ` ${escapeHtml(h.offset_label)}` : "";
-  const speaker = h.speaker ? ` ${escapeHtml(h.speaker)}` : "";
-  return `<div class="hit" data-id="${escapeHtml(h.session_id)}">
-    <div class="ctx">${escapeHtml(when)}${offset}${speaker} · ${escapeHtml(h.session_id)}</div>
-    <div class="line">${escapeHtml(h.context)}</div>
-  </div>`;
+  const when = h.started_at ? h.started_at.replace("T"," ").slice(5) : h.session_id.slice(5);
+  const off = h.offset_label ? ` ${escapeHtml(h.offset_label)}` : "";
+  const sp = h.speaker ? ` ${escapeHtml(h.speaker)}` : "";
+  return `<div class="hit" data-id="${escapeHtml(h.session_id)}"><div class="ctx">${escapeHtml(when)}${off}${sp} · ${escapeHtml(h.session_id)}</div><div class="line">${escapeHtml(h.context)}</div></div>`;
 }
 
-/* ---- detail view ----------------------------------------------------- */
-async function showDetail(id) {
-  view().innerHTML = `<p><a href="#/" class="back">← all sessions</a></p><div class="empty">Loading…</div>`;
+async function sessionsDetail(container, id) {
+  container.innerHTML = `<p><a href="#/sessions" class="back">← all sessions</a></p><div class="empty">Loading…</div>`;
   try {
     const s = await api("/api/sessions/" + encodeURIComponent(id));
     const streams = (s.audio_streams || []).map(streamHtml).join("");
-    const meta = `<div class="detail-meta">
-      <strong>${escapeHtml(s.id)}</strong>
-      · ${escapeHtml(s.status)}
-      · ${escapeHtml(s.duration_human || "—")}
-      · ${s.word_count != null ? s.word_count.toLocaleString() + " words" : ""}
-      ${s.model ? ` · ${escapeHtml(s.model)}` : ""}
-    </div>`;
+    const meta = `<div class="detail-meta"><strong>${escapeHtml(s.id)}</strong> · ${escapeHtml(s.status)} · ${escapeHtml(s.duration_human || "—")} · ${s.word_count != null ? s.word_count.toLocaleString() + " words" : ""}${s.model ? ` · ${escapeHtml(s.model)}` : ""}</div>`;
     let body;
     if (s.status === "silent") {
       body = `<div class="hint">No audio was captured. This usually means the Screen Recording permission wasn't granted, or nothing was playing. The WAV is kept for <code>rec diagnose</code>.</div>`;
     } else if (s.transcript == null) {
       body = `<div class="empty"><strong>No transcript yet.</strong>${transcribeBtnHtml(s)}</div>`;
     } else {
-      body = `
-        ${streams ? `<div class="streams">${streams}</div>` : ""}
-        <div class="transcript-actions">
-          <button onclick="navigator.clipboard.writeText(document.getElementById('tx').innerText)">Copy</button>
-          <a href="data:text/markdown;charset=utf-8,${encodeURIComponent(s.transcript)}" download="transcript.md"><button>Download .md</button></a>
-          ${transcribeBtnHtml(s)}
-        </div>
-        <div class="transcript" id="tx">${renderMarkdown(s.transcript)}</div>`;
+      let healthNote = "";
+      if (isLowQuality(s)) healthNote = `<div class="hint">Few words for the duration — the capture may have failed. Check the audio levels or Screen Recording permission.</div>`;
+      body = `${healthNote}${streams ? `<div class="streams">${streams}</div>` : ""}<div class="transcript-actions"><button onclick="navigator.clipboard.writeText(document.getElementById('tx').innerText)">Copy</button><a href="data:text/markdown;charset=utf-8,${encodeURIComponent(s.transcript)}" download="transcript.md"><button>Download .md</button></a>${transcribeBtnHtml(s)}</div><div class="transcript" id="tx">${renderMarkdown(s.transcript)}</div>`;
     }
-    view().innerHTML = `<p><a href="#/" class="back">← all sessions</a></p>${meta}${body}`;
-  } catch (e) { view().innerHTML = `<p><a href="#/" class="back">← all sessions</a></p>` + errHtml(e); }
+    container.innerHTML = `<p><a href="#/sessions" class="back">← all sessions</a></p>${meta}${body}`;
+  } catch (e) { container.innerHTML = `<p><a href="#/sessions" class="back">← all sessions</a></p>` + errHtml(e); }
 }
-
-function streamHtml(st) {
-  return `<div class="stream"><label>${escapeHtml(st.kind)}</label><audio controls preload="metadata" src="${escapeHtml(st.url)}"></audio></div>`;
-}
-
+function streamHtml(st) { return `<div class="stream"><label>${escapeHtml(st.kind)}</label><audio controls preload="metadata" src="${escapeHtml(st.url)}"></audio></div>`; }
 function transcribeBtnHtml(s) {
-  // The re-transcribe control only makes sense when there's audio to re-run.
   if (!s.audio_streams || !s.audio_streams.length) return "";
-  return `
-    <select id="modelSel" aria-label="model">
-      ${["tiny","base","small","medium","large-v3"].map(m =>
-        `<option value="${m}" ${m === (s.model || "base") ? "selected" : ""}>${m}</option>`).join("")}
-    </select>
-    <button id="retxBtn">Re-transcribe</button>`;
+  return `<select id="modelSel" aria-label="model">${["tiny","base","small","medium","large-v3"].map(m => `<option value="${m}" ${m === (s.model || "base") ? "selected":""}>${m}</option>`).join("")}</select><button id="retxBtn">Re-transcribe</button>`;
 }
-
 async function onRetranscribe(sessionId) {
-  const sel = $("#modelSel");
-  const model = sel ? sel.value : null;
-  try {
-    const r = await api(`/api/sessions/${encodeURIComponent(sessionId)}/transcribe`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model })
-    });
-    pollJob(r.job_id, sessionId, () => showDetail(sessionId));
-  } catch (e) { alert(e.message); }
+  const sel = $("#modelSel"); const model = sel ? sel.value : null;
+  try { const r = await api(`/api/sessions/${encodeURIComponent(sessionId)}/transcribe`, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ model }) }); pollJob(r.job_id, sessionId, () => sessionsDetail(viewEl(), sessionId)); }
+  catch (e) { alert(e.message); }
 }
-
-/* ---- markdown renderer (~30 lines) -----------------------------------
-   Handles headings, paragraphs, and the transcript's two line formats:
-     [MM:SS] text
-     [MM:SS] [Speaker] text
-   No dependency — the transcripts are simple enough. Escapes all input. */
 function renderMarkdown(md) {
-  const lines = md.split("\n");
-  let out = "", inPara = [];
-  const flush = () => {
-    if (inPara.length) { out += `<p>${escapeHtml(inPara.join(" "))}</p>`; inPara = []; }
-  };
+  const lines = md.split("\n"); let out = "", inPara = [];
+  const flush = () => { if (inPara.length) { out += `<p>${escapeHtml(inPara.join(" "))}</p>`; inPara = []; } };
   const tsRe = /^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(?:\[(Mic|System)\]\s*)?(.*)$/;
   for (const raw of lines) {
     const line = raw.trimEnd();
     if (!line.trim()) { flush(); continue; }
-    if (/^#{1,3}\s/.test(line)) { flush(); out += `<h${line.match(/^#+/)[0].length}>${escapeHtml(line.replace(/^#+\s*/, ""))}</h${line.match(/^#+/)[0].length}>`; continue; }
+    if (/^#{1,3}\s/.test(line)) { flush(); const n = line.match(/^#+/)[0].length; out += `<h${n}>${escapeHtml(line.replace(/^#+\s*/,""))}</h${n}>`; continue; }
     if (/^[-*]\s/.test(line)) { flush(); out += `<p class="mute">${escapeHtml(line)}</p>`; continue; }
     const m = line.match(tsRe);
-    if (m) {
-      flush();
-      const speaker = m[2] ? `<span class="speaker">[${escapeHtml(m[2])}]</span>` : "";
-      out += `<div class="ts-line"><time>${escapeHtml(m[1])}</time>${speaker}<span class="words">${escapeHtml(m[3])}</span></div>`;
-    } else {
-      inPara.push(line);
-    }
+    if (m) { flush(); const sp = m[2] ? `<span class="speaker">[${escapeHtml(m[2])}]</span>` : ""; out += `<div class="ts-line"><time>${escapeHtml(m[1])}</time>${sp}<span class="words">${escapeHtml(m[3])}</span></div>`; }
+    else inPara.push(line);
   }
-  flush();
-  return out;
+  flush(); return out;
 }
 
-function errHtml(e) {
-  return `<div class="empty"><strong>${escapeHtml(e.message)}</strong>Try again in a moment.</div>`;
+/* =======================================================================
+   settings view — read-only definition table from /api/config.
+   ======================================================================= */
+const settingsView = {
+  label: "Settings",
+  poll: null,
+  mount(container) {
+    container.innerHTML = `<div class="empty">Loading…</div>`;
+    api("/api/config").then(cfg => renderSettings(container, cfg)).catch(e => { container.innerHTML = errHtml(e); });
+  },
+  unmount() {},
+};
+VIEWS.settings = settingsView;
+
+function renderSettings(container, cfg) {
+  const c = cfg.config;
+  const boolCell = (v) => v == null ? `<td>unknown</td>` : `<td class="${v ? "bool-yes" : "bool-no"}">${v ? "yes" : "no"}</td>`;
+  const note = cfg.setup_hint ? `<div class="hint">${escapeHtml(cfg.setup_hint)}</div>` : `<p class="mute" style="font-family:var(--mono);font-size:var(--fs-xs)">Config is edited by running <code>rec setup</code> in a terminal.</p>`;
+  container.innerHTML = `
+    <h2 style="font-family:var(--mono);font-size:var(--fs-sm);color:var(--mute);text-transform:uppercase;letter-spacing:.06em;margin:0 0 12px;">Environment</h2>
+    <table class="def"><tbody>
+      <tr><th>version</th><td>${escapeHtml(cfg.version)}</td></tr>
+      <tr><th>macOS</th><td>${escapeHtml(cfg.macos_version)} ${cfg.macos_supported === false ? '<span style="color:var(--amber)">(needs 14.2+)</span>' : ""}</td></tr>
+      <tr><th>audiotap</th>${boolCell(cfg.audiotap_usable)}</tr>
+      <tr><th>config present</th>${boolCell(cfg.config_present)}</tr>
+    </tbody></table>
+    <h2 style="font-family:var(--mono);font-size:var(--fs-sm);color:var(--mute);text-transform:uppercase;letter-spacing:.06em;margin:24px 0 12px;">Capture &amp; transcription</h2>
+    <table class="def"><tbody>
+      <tr><th>capture</th><td>${escapeHtml(c.capture)}</td></tr>
+      <tr><th>model</th><td>${escapeHtml(c.whisper_model)}</td></tr>
+      <tr><th>sample rate</th><td>${c.sample_rate} Hz</td></tr>
+      <tr><th>channels</th><td>${c.channels}</td></tr>
+    </tbody></table>
+    <h2 style="font-family:var(--mono);font-size:var(--fs-sm);color:var(--mute);text-transform:uppercase;letter-spacing:.06em;margin:24px 0 12px;">Paths</h2>
+    <table class="def"><tbody>
+      <tr><th>config</th><td>${escapeHtml(cfg.config_path)}</td></tr>
+      <tr><th>sessions</th><td>${escapeHtml(cfg.sessions_root)}</td></tr>
+      <tr><th>index db</th><td>${escapeHtml(cfg.index_db)}</td></tr>
+    </tbody></table>
+    ${note}`;
 }
 
-/* ---- wire retranscribe via event delegation (the button is re-rendered) */
+/* =======================================================================
+   boot
+   ======================================================================= */
+// Build the nav from the registry — the extension point. Each entry is one
+// view; adding a future view (diagnostics, summaries) is one VIEWS entry.
+function buildNav() {
+  const nav = $("#nav");
+  nav.innerHTML = "";
+  for (const [name, v] of Object.entries(VIEWS)) {
+    const a = document.createElement("a");
+    a.href = "#/" + name; a.textContent = v.label;
+    a.setAttribute("data-route", name);
+    nav.appendChild(a);
+  }
+  const foot = document.createElement("div");
+  foot.className = "foot";
+  nav.appendChild(foot);
+  // version comes from /api/config (cheap, cached after first poll)
+  api("/api/config").then(c => { foot.textContent = "v" + c.version; }).catch(() => {});
+}
+
 document.addEventListener("click", (e) => {
   if (e.target && e.target.id === "retxBtn") {
-    const id = (location.hash || "").replace(/^#\/s\//, "");
+    const id = (location.hash || "").replace(/^#\/sessions\//, "");
     if (id) onRetranscribe(decodeURIComponent(id));
   }
 });
 
-/* ---- boot ------------------------------------------------------------ */
-renderStartControls({ recording: false });
+renderControls({ recording: false });
+buildNav();
 refreshStatus();
 route();
 </script>

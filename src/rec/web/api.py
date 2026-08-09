@@ -40,6 +40,7 @@ def register(routes: dict[tuple[str, str], tuple]) -> None:
             ("GET", "/api/sessions/{id}"): (get_session_detail, ["id"]),
             ("GET", "/api/sessions/{id}/audio/{stream}"): (get_audio, ["id", "stream"]),
             ("GET", "/api/search"): (get_search, []),
+            ("GET", "/api/config"): (get_config, []),
             ("POST", "/api/recording/start"): (post_start, []),
             ("POST", "/api/recording/stop"): (post_stop, []),
             ("GET", "/api/jobs/{job_id}"): (get_job, ["job_id"]),
@@ -402,6 +403,72 @@ def _speaker_label(speaker: str | None) -> str | None:
     if not speaker:
         return None
     return f"[{speaker}]"
+
+
+# ---- GET /api/config -------------------------------------------------------
+# Read-only environment + config summary for the Settings view. Never 500s:
+# a missing config returns a clear error state (config_present: false) so the
+# UI can tell the user to run `rec setup`.
+
+
+def _collapse_home(path: str | None) -> str | None:
+    """Replace a leading $HOME with `~` for display; None passes through."""
+    if not path:
+        return None
+    from pathlib import Path
+
+    home = str(Path.home())
+    if path.startswith(home):
+        return "~" + path[len(home):]
+    return path
+
+
+def get_config(h: WebHandler) -> None:
+    """Loaded config + resolved paths + environment probes, read-only.
+
+    Returns ``{version, config_present, config, config_path, sessions_root,
+    index_db, macos_version, macos_supported, audiotap_usable}``. When no
+    config.json exists the response is still 200 with ``config_present: false``
+    and default-valued config + a setup hint — never a traceback.
+    """
+    import platform
+
+    from .. import __version__, envcheck, index
+
+    # Config: fall back to defaults + a flag when the user hasn't run setup.
+    config_present = config.config_path().exists()
+    setup_hint = None
+    try:
+        cfg = config.load_config()
+    except Exception:
+        cfg = config.default_config()
+        setup_hint = "No config found. Run `rec setup` in a terminal first."
+
+    payload: dict = {
+        "version": __version__,
+        "config_present": config_present,
+        "config": cfg.model_dump_jsonable(),
+        "config_path": _collapse_home(str(config.config_path())),
+        "sessions_root": _collapse_home(str(config.sessions_root())),
+        "index_db": _collapse_home(str(index.index_path())),
+        "setup_hint": setup_hint,
+    }
+
+    # Environment probes. Reuse envcheck's non-raising helpers; the names are
+    # underscore-private but the prompt says reuse rather than reimplement. A
+    # probe failure (unexpected) shows "unknown" rather than 500ing the page.
+    try:
+        payload["macos_version"] = platform.mac_ver()[0] or "unknown"
+        payload["macos_supported"] = envcheck._macos_version() >= envcheck.MIN_MACOS
+    except Exception:
+        payload["macos_version"] = "unknown"
+        payload["macos_supported"] = None
+    try:
+        payload["audiotap_usable"] = envcheck._audiotap_usable()
+    except Exception:
+        payload["audiotap_usable"] = None
+
+    h._send_json(HTTPStatus.OK, payload)
 
 
 # ---- POST /api/recording/start --------------------------------------------
