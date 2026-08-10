@@ -6,6 +6,7 @@ and the transcriber's whisper model are both mocked.
 
 from __future__ import annotations
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -368,6 +369,85 @@ def test_stop_transcribes_and_keeps_no_device_state(monkeypatch, cfg_written, fa
     assert session.transcript_path(sid).exists()
 
 
+def test_transcribe_sets_transcribing_status_mid_call(monkeypatch, cfg_written, fake_audio_levels):
+    """STATUS_TRANSCRIBING is on the session while the model is running.
+
+    The stubbed transcriber inspects meta on entry, before the terminal status
+    is written, so we can prove the in-flight state is observable to anyone
+    reading session.json concurrently (the web UI, or `rec status`).
+    """
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_RECORDING)
+    session.create_session_dir(sid)
+    session.wav_path(sid).write_bytes(b"RIFF...fake")
+
+    monkeypatch.setattr(recorder, "active_pid", lambda: 4321)
+    monkeypatch.setattr(recorder, "stop_recorder", lambda: (True, 4321))
+
+    seen: dict = {}
+
+    def spying_transcribe(wav, model_name="base", language="en", console=None, vad_filter=False):
+        # The recorder has stopped; transcription has started. The session must
+        # be marked transcribing before the first transcribe call returns.
+        meta = session.load_meta(sid)
+        seen["status_during"] = meta.status if meta else None
+        return TranscriptResult(
+            segments=[Segment(0.0, 12.0, "Hello world.")],
+            duration=12.0,
+            language="en",
+            language_probability=0.95,
+        )
+
+    monkeypatch.setattr(cli.transcriber, "transcribe", spying_transcribe)
+
+    res = CliRunner().invoke(cli.cli, ["stop"])
+    assert res.exit_code == 0, res.output
+    assert seen["status_during"] == session.STATUS_TRANSCRIBING
+    # And it clears to the terminal state afterwards.
+    assert session.load_meta(sid).status == session.STATUS_TRANSCRIBED
+
+
+def test_transcribe_rolls_back_to_recorded_on_error(monkeypatch, cfg_written, fake_audio_levels):
+    """A failed transcription must not leave the session stuck in TRANSCRIBING."""
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_RECORDING)
+    session.create_session_dir(sid)
+    session.wav_path(sid).write_bytes(b"RIFF...fake")
+
+    monkeypatch.setattr(recorder, "active_pid", lambda: 4321)
+    monkeypatch.setattr(recorder, "stop_recorder", lambda: (True, 4321))
+
+    def boom(wav, model_name="base", language="en", console=None, vad_filter=False):
+        raise RuntimeError("model load failed")
+
+    monkeypatch.setattr(cli.transcriber, "transcribe", boom)
+
+    res = CliRunner().invoke(cli.cli, ["stop"])
+    # The error propagates out of `main()` as a non-zero exit.
+    assert res.exit_code != 0
+    assert session.load_meta(sid).status == session.STATUS_RECORDED
+
+
+def test_status_reports_transcribing(monkeypatch, xdg):
+    """`rec status` shows in-flight transcription when no recorder is running."""
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_TRANSCRIBING)
+
+    monkeypatch.setattr(recorder, "active_pid", lambda: None)
+    res = CliRunner().invoke(cli.cli, ["status"])
+    assert res.exit_code == 0, res.output
+    assert "Transcribing" in res.output
+    assert sid in res.output
+
+
+def test_status_idle_when_not_recording_or_transcribing(monkeypatch, xdg):
+    monkeypatch.setattr(recorder, "active_pid", lambda: None)
+    res = CliRunner().invoke(cli.cli, ["status"])
+    assert res.exit_code == 0, res.output
+    assert "Not recording" in res.output
+    assert "Transcribing" not in res.output
+
+
 def test_stop_merges_mic_plus_system_transcript(monkeypatch, cfg_written, fake_transcribe, fake_audio_levels):
     """When both recording.wav and recording-mic.wav exist, the merged transcript is built."""
     sid = session.new_session_id()
@@ -568,6 +648,22 @@ def test_list_shows_sessions(monkeypatch, cfg_written, xdg):
     assert "2026-07-27 14:30" in res.output
     assert "transcribed" in res.output.lower()
     assert "4,231" in res.output
+    # The Health column header is present.
+    assert "Health" in res.output
+
+
+def test_list_shows_capture_health_column(monkeypatch, cfg_written, xdg):
+    """The health column flags suspect/silent sessions so a CLI user sees them."""
+    # A suspect session: long duration, very few words.
+    session.update_meta("2026-07-27_14-30-00", status=session.STATUS_TRANSCRIBED,
+                        duration=600.0, word_count=10, model="base")
+    # A silent session.
+    session.update_meta("2026-07-27_15-00-00", status=session.STATUS_SILENT,
+                        duration=120.0, word_count=0)
+    res = CliRunner().invoke(cli.cli, ["list"])
+    assert res.exit_code == 0, res.output
+    assert "suspect" in res.output
+    assert "silent" in res.output
 
 
 def test_list_empty(monkeypatch, cfg_written, xdg):
@@ -681,7 +777,7 @@ def test_help_lists_all_commands():
     res = CliRunner().invoke(cli.cli, ["--help"])
     assert res.exit_code == 0
     for cmd in ("setup", "start", "stop", "list", "status", "transcribe", "diagnose",
-                "mcp", "index"):
+                "mcp", "index", "web"):
         assert cmd in res.output
 
 
@@ -690,6 +786,57 @@ def test_mcp_help_lists_install_subcommand():
     res = CliRunner().invoke(cli.cli, ["mcp", "--help"])
     assert res.exit_code == 0
     assert "install" in res.output
+
+
+# ---- web (local browser UI) ----------------------------------------------
+
+
+def test_web_help_reads_correctly():
+    """`rec web --help` shows the port flag and the loopback-only rationale."""
+    res = CliRunner().invoke(cli.cli, ["web", "--help"])
+    assert res.exit_code == 0
+    assert "--port" in res.output
+    assert "--no-open" in res.output
+    # No --host flag is offered (loopback-only is the security model).
+    assert "--host" not in res.output
+
+
+def test_web_bypasses_envcheck(xdg, monkeypatch):
+    """`rec web` runs even where audio capture can't (it's read-mostly)."""
+    # Force envcheck to fail; the read-only gate must skip it for `web`.
+    def boom():
+        raise click.ClickException("rec only runs on macOS 14.2 or later.")
+    monkeypatch.setattr(cli.envcheck, "check_runtime", boom)
+    # Patch serve() so we don't actually start a blocking server.
+    from rec.web import server as web_server
+    called: list = []
+    monkeypatch.setattr(
+        web_server, "serve",
+        lambda port, open_browser: called.append((port, open_browser)),
+    )
+    res = CliRunner().invoke(cli.cli, ["web"])
+    assert res.exit_code == 0, res.output
+    assert called == [(7717, True)]
+
+
+def test_web_port_collision_prints_one_line(xdg, monkeypatch):
+    """An occupied port exits non-zero with a clean message, never a traceback."""
+    import socket
+
+    # Grab a port that's in use, then ask `rec web` to bind it.
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    occupied = holder.getsockname()[1]
+    try:
+        res = CliRunner().invoke(cli.cli, ["web", "--port", str(occupied), "--no-open"])
+    finally:
+        holder.close()
+    assert res.exit_code != 0
+    assert str(occupied) in res.output
+    assert "--port" in res.output
+    # No traceback: the message is a ClickException, printed as "Error: ...".
+    assert "Traceback" not in res.output
 
 
 def test_version():
@@ -732,6 +879,55 @@ def test_index_bypasses_envcheck_gate(monkeypatch, xdg):
     res = CliRunner().invoke(cli.cli, ["index"])
     assert res.exit_code == 0, res.output
     assert "macOS" not in res.output  # gate did NOT fire
+
+
+def test_index_status_reports_counts_and_orphans(xdg):
+    """`rec index --status` shows lines/sessions and flags orphan rows."""
+    # Index one real session, then delete its dir to create an orphan.
+    sid = "2026-07-27_14-30-00"
+    session.create_session_dir(sid)
+    session.update_meta(sid, status=session.STATUS_TRANSCRIBED)
+    session.transcript_path(sid).write_text(
+        "# Meeting\n\n---\n\n[00:00] Hello world.\n", encoding="utf-8")
+    from rec import index as index_mod
+    index_mod.ensure_indexed(rebuild=True)
+    import shutil
+    shutil.rmtree(session.session_dir(sid))
+
+    res = CliRunner().invoke(cli.cli, ["index", "--status"])
+    assert res.exit_code == 0, res.output
+    assert "Orphans:" in res.output
+    assert "Sessions indexed:" in res.output
+
+
+def test_mcp_status_not_wired_when_no_entry(xdg, monkeypatch):
+    """mcp_status() reports not-wired when .claude.json has no entry."""
+    # xdg returns tmp_path; use it as HOME so the real file is never touched.
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/rec")
+    st = cli.mcp_status(home=xdg)
+    assert st["wired"] is False
+    assert "rec mcp install" in st["note"]
+
+
+def test_mcp_status_wired_when_entry_matches(xdg, monkeypatch):
+    """A matching mcpServers entry reads as wired."""
+    import json as _json
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/rec")
+    expected = {"type": "stdio", "command": "/usr/local/bin/rec", "args": ["mcp"]}
+    (xdg / ".claude.json").write_text(
+        _json.dumps({"mcpServers": {"call-copilot": expected}}))
+    st = cli.mcp_status(home=xdg)
+    assert st["wired"] is True
+
+
+def test_mcp_status_command_runs(xdg, monkeypatch):
+    """The `rec mcp status` CLI command exits 0 and prints a status line."""
+    monkeypatch.setattr(cli, "mcp_status",
+                        lambda **k: {"wired": False, "path": "/x/.claude.json",
+                                     "note": "test"})
+    res = CliRunner().invoke(cli.cli, ["mcp", "status"])
+    assert res.exit_code == 0, res.output
+    assert "not wired" in res.output.lower()
 
 
 def test_mcp_bypasses_envcheck_gate(monkeypatch, xdg):

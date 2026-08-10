@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -58,12 +59,33 @@ def validate_session_id(session_id: str) -> str:
 # Valid lifecycle statuses.
 STATUS_RECORDING = "recording"
 STATUS_RECORDED = "recorded"
+# Transcription is running in the background (web job pool, or inline via the
+# CLI). Set before the model starts, cleared (to TRANSCRIBED/SILENT/RECORDED)
+# when it finishes. Surfaces in `rec status` and the web UI so a second process
+# doesn't think the machine is idle while Whisper is grinding.
+STATUS_TRANSCRIBING = "transcribing"
 STATUS_TRANSCRIBED = "transcribed"
 # A SILENT session captured only zero samples — nothing to transcribe.
 # Whisper on pure silence hallucinates text (e.g. a repeated "You"), so we
 # skip transcription entirely and mark the session SILENT instead. The WAV
 # stays on disk for `rec diagnose` to inspect.
 STATUS_SILENT = "silent"
+
+# The canonical session id shape: YYYY-MM-DD_HH-MM-SS. Single source of truth
+# for "is this a real session directory" — used by list_sessions to skip stray
+# folders, and by the web router to reject non-conformant ids (path-traversal
+# defense) before they reach session_dir.
+_SESSION_ID_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+
+
+def is_valid_session_id(session_id: str) -> bool:
+    """True if ``session_id`` matches the canonical ``YYYY-MM-DD_HH-MM-SS`` shape.
+
+    Uses :func:`re.fullmatch` rather than ``$`` anchoring: ``$`` matches before
+    a trailing newline, so ``"2026-01-01_00-00-00\\n"`` would slip through a
+    ``^...$`` pattern even though it's not a valid (or safe) id.
+    """
+    return bool(_SESSION_ID_PATTERN.fullmatch(session_id))
 
 
 def new_session_id(now: datetime | None = None) -> str:
@@ -95,6 +117,17 @@ def session_json_path(session_id: str) -> Path:
 
 def transcript_path(session_id: str) -> Path:
     return session_dir(session_id) / TRANSCRIPT_FILENAME
+
+
+def audio_sources(session_id: str) -> tuple[bool, bool]:
+    """Which audio sources a session captured, inferred from which WAVs exist.
+
+    Returns ``(has_mic, has_system)``. Source is inferred from disk rather than
+    stored in session.json — that's the existing decision (no explicit source
+    field is written), so callers that need it derive it here. Centralised so
+    the CLI and the web API don't each reimplement the ``.exists()`` check.
+    """
+    return mic_wav_path(session_id).exists(), wav_path(session_id).exists()
 
 
 def create_session_dir(session_id: str) -> Path:
@@ -160,14 +193,64 @@ def update_meta(session_id: str, **changes) -> SessionMeta:
     return meta
 
 
+# The diagnostic shown to the user when a session captured only zero samples.
+# One string, defined once here, served to both the CLI (`rec stop`, `rec list`)
+# and the web UI — so the wording can't drift between surfaces.
+SILENT_DIAGNOSTIC_HINT = (
+    "No audio was captured. This usually means the Screen Recording permission "
+    "wasn't granted, or nothing was playing. The WAV is kept for `rec diagnose`."
+)
+
+# A suspect session: enough duration that real speech should have produced many
+# more words. <20 wpm over >30s is well below any real conversation (130–150
+# wpm) and above Whisper-on-silence hallucination density (single digits over
+# minutes). The duration floor stops short test recordings from tripping it.
+SUSPECT_WPM = 20.0
+SUSPECT_MIN_DURATION_S = 30.0
+
+
+def capture_health(meta: SessionMeta) -> str:
+    """How usable a session's capture looks: ``ok``/``suspect``/``silent``/``unknown``.
+
+    Pure function over ``SessionMeta`` (not a session id) so it's testable
+    without touching disk. The rule lives here — the single source — so the
+    CLI (`rec list`) and the web API flag the same sessions.
+
+    - ``silent``  — the recorder already marked it silent (``STATUS_SILENT``).
+    - ``unknown`` — duration or word_count isn't set yet (still recording, or
+      pre-transcription); must NOT be flagged as a failure.
+    - ``suspect`` — duration > 30s and words-per-minute < ``SUSPECT_WPM``: a
+      likely failed capture (silent tap, revoked permission, no audio playing).
+    - ``ok``      — otherwise.
+    """
+    if meta.status == STATUS_SILENT:
+        return "silent"
+    if meta.duration is None or meta.word_count is None:
+        return "unknown"
+    if meta.duration > SUSPECT_MIN_DURATION_S:
+        wpm = meta.word_count / (meta.duration / 60.0)
+        if wpm < SUSPECT_WPM:
+            return "suspect"
+    return "ok"
+
+
 def list_sessions() -> list[SessionMeta]:
-    """All sessions newest-first (by id, which sorts chronologically)."""
+    """All sessions newest-first (by id, which sorts chronologically).
+
+    Only directories whose name is a canonical session id
+    (``YYYY-MM-DD_HH-MM-SS``) are returned. Stray directories under the
+    sessions root (test artifacts, manually-created folders) are ignored so
+    they don't surface as unopenable rows in the list/web UI or push real
+    sessions below the fold in the chronological sort.
+    """
     root = config.sessions_root()
     if not root.exists():
         return []
     out: list[SessionMeta] = []
     for child in sorted(root.iterdir(), reverse=True):
         if not child.is_dir():
+            continue
+        if not _SESSION_ID_PATTERN.fullmatch(child.name):
             continue
         meta = load_meta(child.name)
         if meta is not None:

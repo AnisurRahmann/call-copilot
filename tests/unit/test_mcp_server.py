@@ -419,10 +419,18 @@ def test_tool_functions_have_introspectable_signatures():
 
 
 def test_mcp_server_module_does_not_import_recorder():
-    """The read-only server must not import the recording machinery."""
+    """The read-only server must not import the recording machinery or the web UI.
+
+    `rec.mcp_server` is strictly read-only and never imports `recorder` (audio
+    capture), `transcriber` (the model), `audio_check` (silence analysis), or
+    `rec.web` (the mutating browser UI). This is what lets the MCP server run
+    anywhere transcripts exist, on machines that can't record. The guard is a
+    source check so a future edit can't quietly add a dependency; the
+    end-to-end check is test_handshake_stdout_is_pure.
+    """
     src = Path(mcp_server.__file__).read_text(encoding="utf-8")
     # The only modules it should import from rec are read-side ones.
-    forbidden = ["recorder", "transcriber", "audio_check"]
+    forbidden = ["recorder", "transcriber", "audio_check", "web"]
     for bad in forbidden:
         assert f"from . import {bad}" not in src, f"mcp_server imports {bad} (not read-only)"
         assert f"import {bad}" not in src, f"mcp_server imports {bad} (not read-only)"

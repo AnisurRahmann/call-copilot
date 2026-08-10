@@ -62,6 +62,12 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Ship the single-file browser UI in the wheel + sdist. Without this, `rec web`
+# installs fine and 404s on `/` — the Homebrew formula builds from the sdist,
+# so the static file must be declared here, not relied on by "it works locally".
+[tool.setuptools.package-data]
+"rec.web" = ["static/*.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

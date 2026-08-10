@@ -59,6 +59,45 @@ def _audiotap_usable() -> bool:
         return False
 
 
+def mic_permission() -> str:
+    """Microphone permission state: ``"granted"``/``"denied"``/``"unknown"``.
+
+    Non-prompting (queries status, never triggers the OS dialog). Wraps the
+    audiotap probe the recorder already uses, so the Overview and `rec start`
+    agree. ``"unknown"`` is the safe answer off-macOS or if audiotap is absent.
+    """
+    try:
+        import audiotap
+
+        status = audiotap.mic_permission_status()
+        if status == audiotap.Permission.GRANTED:
+            return "granted"
+        if status == audiotap.Permission.DENIED:
+            return "denied"
+        return "unknown"  # UNKNOWN — may prompt at tap time
+    except Exception:
+        return "unknown"
+
+
+def screen_capture_status() -> str:
+    """Screen Recording permission: ``"granted"``/``"denied"``/``"unknown"``.
+
+    Always returns ``"unknown"`` for now. There's no audiotap binding for
+    screen capture, and the CoreGraphics preflight
+    (``CGPreflightScreenCaptureAccess``) is unreliable for a bare CLI: TCC
+    attributes the permission to the responsible process (the parent
+    terminal), so the preflight reads ``python``'s own entitlement and
+    returns a false "denied" even when the audiotap SystemTap works fine
+    (verified — capture succeeds while the preflight reports denied).
+
+    Rather than ship a wrong answer, we report ``unknown`` and point the
+    user at the ground truth: ``rec setup`` opens a real tap and checks
+    whether it captures. The Overview says "run rec setup to test" in this
+    state. If a reliable probe lands in audiotap later, wire it here.
+    """
+    return "unknown"
+
+
 def check_runtime() -> None:
     """Abort with an actionable message if this environment can't record.
 
