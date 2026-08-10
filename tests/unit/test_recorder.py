@@ -246,6 +246,14 @@ def test_parse_capture_modes():
         recorder._parse_capture("nonsense")
 
 
+def test_capture_modes_canonical_list_is_single_source():
+    """CAPTURE_MODES is the list the API/web offer; every one must parse."""
+    assert recorder.CAPTURE_MODES == ("mic+system", "mic", "system")
+    for mode in recorder.CAPTURE_MODES:
+        # each canonical mode is accepted (no alias needed)
+        assert isinstance(recorder._parse_capture(mode), set)
+
+
 def test_module_entry_point_parses_args(monkeypatch):
     """`python -m rec.recorder` arg parsing wires into run_detached."""
     captured = {}

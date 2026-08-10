@@ -17,9 +17,15 @@ user's audio routing.
 
 from __future__ import annotations
 
+import json
+import os
 import platform
+import shutil
+import subprocess
+import tempfile
 import time
 from datetime import datetime
+from pathlib import Path
 
 import click
 import rich.box
@@ -60,7 +66,14 @@ def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
     # callback, so they still work on unsupported systems (handy for "what
     # version is this broken install?"). cli.main() catches the ClickException
     # and prints a clean one-line error with exit code 1 — no traceback.
-    envcheck.check_runtime()
+    #
+    # The read-only commands skip this gate: `rec mcp` / `rec index` only read
+    # transcripts on disk and have nothing to do with audiotap/Core Audio, so
+    # they must run on any machine that has transcripts to read (including a
+    # non-Mac where recordings were copied in, or in CI).
+    _READ_ONLY_COMMANDS = {"mcp", "index", "web"}
+    if ctx.invoked_subcommand not in _READ_ONLY_COMMANDS:
+        envcheck.check_runtime()
     _setup_logging_for_run(verbose, quiet, ctx.invoked_subcommand)
 
 
@@ -601,15 +614,26 @@ def list_(limit: int) -> None:
     table.add_column("Duration", justify="right", style="magenta")
     table.add_column("Words", justify="right")
     table.add_column("Status", justify="center")
+    table.add_column("Health", justify="center")
     table.add_column("Model", justify="center", style="dim")
 
     for m in sessions:
         words = "—" if m.word_count is None else f"{m.word_count:,}"
+        health = session.capture_health(m)
+        # suspect/silent carry weight (yellow) — a failed capture is the one
+        # thing a CLI user most needs to spot. ok is dim; unknown is muted.
+        if health in ("suspect", "silent"):
+            health_cell = f"[yellow]{health}[/]"
+        elif health == "ok":
+            health_cell = f"[dim]{health}[/]"
+        else:
+            health_cell = f"[dim]{health}[/]"
         table.add_row(
             session.started_at_display(m.id),
             session.format_duration_human(m.duration),
             words,
             m.status,
+            health_cell,
             m.model or "",
         )
 
@@ -624,7 +648,14 @@ def status() -> None:
     """Show whether a recording is in progress."""
     pid = recorder.active_pid()
     if pid is None:
-        click.echo("Not recording.")
+        # Not capturing — but a transcription may still be running in the
+        # background (web job pool, or a parallel `rec transcribe`). Surface it
+        # so the machine doesn't look idle while Whisper is grinding.
+        transcribing = _transcribing_session()
+        if transcribing is not None:
+            click.echo(f"Transcribing (session {transcribing}).")
+        else:
+            click.echo("Not recording.")
         return
 
     session_id = _current_recording_session_id()
@@ -647,6 +678,20 @@ def status() -> None:
 
     size_str = f"  size: {_format_bytes(size)}" if size is not None else ""
     click.echo(f"Recording (pid {pid}, session {session_id}){elapsed}{size_str}")
+
+
+def _transcribing_session() -> str | None:
+    """Return the id of the session currently being transcribed, if any.
+
+    A session stuck in STATUS_TRANSCRIBING while no recorder is running means
+    a transcription is in flight (web job pool, or `rec transcribe` in another
+    terminal). Used by `rec status` so the user sees that state instead of
+    "Not recording". Newest match wins if there's ever more than one.
+    """
+    for meta in session.list_sessions():
+        if meta.status == session.STATUS_TRANSCRIBING:
+            return meta.id
+    return None
 
 
 def _format_elapsed(started: datetime) -> str:
@@ -720,7 +765,12 @@ def diagnose(session_id: str, global_log_lines: int, to_stdout: bool) -> None:
     (see `rec list`). A unique prefix is also accepted — e.g. `2026-07-27`
     matches `2026-07-27_14-30-00`.
     """
-    resolved = _resolve_session_id(session_id)
+    try:
+        resolved = _resolve_session_id(session_id)
+    except session.AmbiguousSessionId as e:
+        raise click.ClickException(
+            f"{e} Run `rec list` to see session ids."
+        ) from e
     if resolved is None:
         raise click.ClickException(
             f"No session matches '{session_id}'. Run `rec list` to see session ids."
@@ -734,6 +784,326 @@ def diagnose(session_id: str, global_log_lines: int, to_stdout: bool) -> None:
     click.echo(f"Diagnose bundle written: {out_path} ({len(bundle):,} bytes)")
     if to_stdout:
         click.echo(bundle)
+
+
+# ---- web (local browser UI) ----------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--port",
+    type=int,
+    default=7717,
+    show_default=True,
+    help="Port to serve the browser UI on (127.0.0.1 only).",
+)
+@click.option(
+    "--no-open",
+    is_flag=True,
+    help="Do not open a browser tab automatically.",
+)
+def web(port: int, no_open: bool) -> None:
+    """Open a local browser UI for browsing sessions and recordings.
+
+    Serves a single-page app on 127.0.0.1 that lists sessions, plays audio,
+    reads transcripts, searches, and starts/stops a recording — modelled on the
+    qBittorrent/Transmission web UI. Bound to loopback only; the host is not
+    configurable, by design (a local tool must not become an open transcript
+    server). Viewing transcripts has nothing to do with audio capture, so this
+    command skips the macOS/audiotap envcheck and runs anywhere transcripts
+    exist. The Start button returns a clear error if config is missing.
+    """
+    from .web import server as web_server
+
+    web_server.serve(port=port, open_browser=not no_open)
+
+
+# ---- mcp (expose transcripts to Claude Code / other MCP clients) -----------
+
+
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def mcp(ctx: click.Context) -> None:
+    """Expose your meeting transcripts to Claude Code and other MCP clients.
+
+    \b
+    Bare `rec mcp` runs the MCP server on stdio — point an MCP client at it.
+    `rec mcp install` writes the server entry into Claude Code's config for you.
+
+    The server is strictly READ-ONLY: it lists, reads, and searches transcripts.
+    It never starts, stops, or deletes a recording, and it makes no network calls.
+    """
+    if ctx.invoked_subcommand is None:
+        # Bare `rec mcp` → run the stdio server.
+        _run_mcp_server()
+
+
+def _run_mcp_server() -> None:
+    """Launch the read-only MCP stdio server. Errors cleanly if `mcp` is missing."""
+    try:
+        from . import mcp_server
+    except ImportError as e:
+        raise click.ClickException(
+            "The MCP server needs the `mcp` package, which isn't installed. "
+            "Reinstall call-copilot (the dependency should come in automatically), "
+            f"or run `pip install mcp`. (detail: {e})"
+        ) from e
+    mcp_server.run()
+
+
+@mcp.command()
+@click.option(
+    "--scope",
+    type=click.Choice(["local", "project", "user"], case_sensitive=False),
+    default="user",
+    show_default=True,
+    help="Claude Code scope to install into (used by `claude mcp add`). "
+         "user = available everywhere; project = this repo only; local = this dir only.",
+)
+def install(scope: str) -> None:
+    """Register this `rec` as an MCP server in Claude Code (and print config for others).
+
+    If the `claude` CLI is on PATH, this runs `claude mcp add call-copilot --scope <s> -- rec mcp`
+    (the supported path — Claude manages its own config). Otherwise it hand-merges the
+    entry into `~/.claude.json` under `mcpServers`. Either way it prints the exact JSON
+    block added, plus a manual config block for Cursor / Zed / Cline and other clients.
+
+    Refuses to clobber a differing existing entry (prints the diff and exits non-zero).
+    Read-only: only writes the MCP client's config file.
+    """
+    _mcp_install(scope)
+
+
+def _resolve_rec_command() -> list[str]:
+    """Resolve the argv to launch `rec mcp` for an MCP client.
+
+    Prefers a `rec` on PATH (matches how the user runs it); falls back to
+    `python -m rec.mcp_server` so the command still works in editable/dev
+    installs where `rec` may not be on PATH.
+    """
+    import sys
+
+    rec_on_path = shutil.which("rec")
+    if rec_on_path:
+        return [rec_on_path, "mcp"]
+    # Dev/editable fallback: launch the module directly with this interpreter.
+    return [sys.executable, "-m", "rec.mcp_server"]
+
+
+def _manual_config_block() -> str:
+    """The JSON config block a user can paste into any MCP client config."""
+    cmd = _resolve_rec_command()
+    entry = {"type": "stdio", "command": cmd[0]}
+    if len(cmd) > 1:
+        entry["args"] = cmd[1:]
+    return json.dumps({"call-copilot": entry}, indent=2)
+
+
+def _mcp_install(scope: str) -> None:
+    """Implementation of `rec mcp install` (split out for testability)."""
+    log = log_mod.get_logger(__name__)
+    cmd = _resolve_rec_command()
+    log.info("mcp install: resolved rec command %s", cmd)
+
+    # 1. Preferred path: the `claude` CLI manages its own config.
+    claude_bin = shutil.which("claude")
+    if claude_bin:
+        # `claude mcp add <name> [--scope <s>] -- <command...>`
+        argv = [claude_bin, "mcp", "add", "call-copilot", "--scope", scope, "--", *cmd]
+        click.echo(f"Running: {' '.join(argv)}")
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, check=False)
+        except OSError as e:
+            raise click.ClickException(f"Failed to run `claude mcp add`: {e}") from e
+        click.echo(result.stdout.rstrip())
+        if result.returncode != 0:
+            click.secho(result.stderr.rstrip(), fg="red", err=True)
+            raise click.ClickException(
+                f"`claude mcp add` exited {result.returncode}. "
+                "You can fall back to a manual edit — see the config block below."
+            )
+        click.echo("")
+        click.echo("Installed via the Claude Code CLI.")
+    else:
+        # 2. Fallback: hand-merge ~/.claude.json (top-level mcpServers).
+        home = Path.home()
+        claude_json = home / ".claude.json"
+        click.echo(f"`claude` CLI not found on PATH — merging into {claude_json} directly.")
+        try:
+            if claude_json.exists():
+                data = json.loads(claude_json.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise click.ClickException(
+                        f"{claude_json} is not a JSON object — refusing to overwrite."
+                    )
+            else:
+                data = {}
+        except (json.JSONDecodeError, OSError) as e:
+            raise click.ClickException(f"Could not read {claude_json}: {e}") from e
+
+        servers = data.setdefault("mcpServers", {})
+        desired = {"type": "stdio", "command": cmd[0]}
+        if len(cmd) > 1:
+            desired["args"] = cmd[1:]
+
+        existing = servers.get("call-copilot")
+        if existing is not None and existing != desired:
+            # Refuse to clobber a differing entry.
+            click.secho(
+                "An existing `call-copilot` MCP entry differs from what `rec mcp install` "
+                "would write. Refusing to clobber it.",
+                fg="yellow", err=True,
+            )
+            click.echo("  existing: " + json.dumps(existing, indent=2).replace("\n", "\n  "))
+            click.echo("  desired:  " + json.dumps(desired, indent=2).replace("\n", "\n  "))
+            click.echo(
+                "Remove the existing entry first (or run `claude mcp remove call-copilot`), "
+                "then re-run `rec mcp install`."
+            )
+            raise click.ClickException("Refusing to clobber a differing existing MCP entry.")
+
+        servers["call-copilot"] = desired
+        # Atomic + private write: a uniquely-named temp file in the same dir
+        # (so the rename is atomic), created with mode 0600 so the merged
+        # config — which may carry other servers' command paths / tokens — is
+        # never briefly world-readable, then os.replace onto the target.
+        payload = json.dumps(data, indent=2) + "\n"
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".claude.json.", suffix=".tmp", dir=str(claude_json.parent)
+        )
+        try:
+            os.chmod(tmp_name, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            os.replace(tmp_name, claude_json)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        click.echo(f"Wrote `call-copilot` MCP server entry into {claude_json}.")
+
+    # Always print the JSON block + manual config for other clients.
+    click.echo("")
+    click.echo("Entry added:")
+    click.echo(_manual_config_block())
+    click.echo("")
+    click.echo(
+        "For Cursor / Zed / Cline / other MCP clients, paste the block above into "
+        "that client's MCP config (e.g. Cursor: .cursor/mcp.json; Zed: settings.json "
+        "under \"mcp_servers\"). The server is read-only — it can't touch recordings."
+    )
+
+
+def mcp_status(*, home: Path | None = None) -> dict:
+    """Whether the MCP server is wired into Claude Code.
+
+    Reads ``~/.claude.json`` (the file the fallback install path writes, and
+    where ``claude mcp add --scope user`` also lands) and checks the
+    ``mcpServers["call-copilot"]`` entry against the command ``rec mcp`` would
+    actually launch. Returns ``{wired: bool, path: str, note: str|None}``.
+
+    ``home`` is injectable for tests (defaults to the real ``Path.home()``).
+
+    Note: when the install went through the ``claude`` CLI with a non-user
+    scope, Claude manages its own config and this read may not see it — the
+    ``note`` field says so rather than reporting a false negative.
+    """
+    home = home if home is not None else Path.home()
+    claude_json = home / ".claude.json"
+    expected_cmd = _resolve_rec_command()
+    expected = {"type": "stdio", "command": expected_cmd[0]}
+    if len(expected_cmd) > 1:
+        expected["args"] = expected_cmd[1:]
+
+    if not claude_json.exists():
+        return {"wired": False, "path": str(claude_json),
+                "note": "Not installed. Run `rec mcp install`."}
+    try:
+        data = json.loads(claude_json.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"wired": False, "path": str(claude_json),
+                "note": f"{claude_json} is unreadable or not valid JSON."}
+    servers = data.get("mcpServers", {}) if isinstance(data, dict) else {}
+    entry = servers.get("call-copilot")
+    if entry is None:
+        return {"wired": False, "path": str(claude_json),
+                "note": "Not found in mcpServers. Run `rec mcp install`."}
+    # Allow entry with/without args; compare command + args.
+    if entry.get("command") == expected["command"] and entry.get("args") == expected.get("args"):
+        return {"wired": True, "path": str(claude_json),
+                "note": "Installed via ~/.claude.json (or `claude mcp add --scope user`)."}
+    return {"wired": True, "path": str(claude_json),
+            "note": "Wired, but the command differs from what `rec mcp` launches now "
+                    "(may be stale from a different install). Run `rec mcp install` to refresh."}
+
+
+@mcp.command(name="status")
+def mcp_status_cmd() -> None:
+    """Show whether the MCP server is wired into Claude Code."""
+    st = mcp_status()
+    click.echo(f"Config: {st['path']}")
+    if st["wired"]:
+        click.secho("Status: wired", fg="green")
+    else:
+        click.secho("Status: not wired", fg="yellow")
+    if st["note"]:
+        click.echo(st["note"])
+
+
+# ---- index (forced reindex of the FTS5 search cache) -----------------------
+
+
+@cli.command()
+@click.option(
+    "--rebuild",
+    is_flag=True,
+    help="Drop the search index and rebuild it from every transcript on disk.",
+)
+@click.option(
+    "--status",
+    "show_status",
+    is_flag=True,
+    help="Show index health (lines, sessions, last indexed, orphans) and exit.",
+)
+def index(rebuild: bool, show_status: bool) -> None:
+    """Build or refresh the transcript search index (FTS5).
+
+    Search (`rec mcp`'s search_transcripts tool) indexes lazily on first use; this
+    command lets you force a refresh — useful after bulk edits, or with `--rebuild`
+    to recreate a stale/corrupt index. The index is a disposable cache at
+    ~/.local/share/rec/index.db and can be safely deleted at any time.
+    """
+    from . import index as index_mod
+
+    if show_status:
+        st = index_mod.stats()
+        click.echo(f"Sessions indexed: {st.sessions}")
+        click.echo(f"Lines indexed:    {st.lines}")
+        if st.last_indexed_at is not None:
+            when = datetime.fromtimestamp(st.last_indexed_at).strftime("%Y-%m-%d %H:%M")
+            click.echo(f"Last indexed:     {when}")
+        else:
+            click.echo("Last indexed:     —")
+        orphans = st.orphans
+        if orphans:
+            click.secho(f"Orphans:          {orphans} indexed session(s) no longer on disk",
+                        fg="yellow")
+        else:
+            click.echo("Orphans:          0")
+        click.echo(f"Index:            {index_mod.index_path()}")
+        return
+
+    n = index_mod.ensure_indexed(rebuild=rebuild)
+    if rebuild:
+        click.echo(f"Rebuilt index from scratch: {n} session(s) indexed.")
+    elif n:
+        click.echo(f"Indexed {n} new/updated session(s).")
+    else:
+        click.echo("Index is up to date (0 sessions needed reindexing).")
+    db = index_mod.index_path()
+    click.echo(f"Index: {db}")
 
 
 # ---- shared transcription helper ------------------------------------------
@@ -763,6 +1133,35 @@ def _transcribe_session(
         # _finish_session already handled the no-WAV case, but guard anyway.
         raise click.ClickException(f"No recording found for session {session_id}.")
 
+    # Mark the session as transcribing BEFORE the (slow) model load + decode so
+    # `rec status` and the web UI show in-flight state. Cleared to a terminal
+    # status below; on error we drop back to RECORDED so the session isn't
+    # stuck "transcribing" forever.
+    session.update_meta(session_id, status=session.STATUS_TRANSCRIBING)
+    try:
+        return _transcribe_session_inner(
+            session_id, model_name, sys_wav, mic_wav, has_sys, has_mic, vad_filter
+        )
+    except Exception:
+        session.update_meta(session_id, status=session.STATUS_RECORDED)
+        raise
+
+
+def _transcribe_session_inner(
+    session_id: str,
+    model_name: str,
+    sys_wav: Path,
+    mic_wav: Path,
+    has_sys: bool,
+    has_mic: bool,
+    vad_filter: bool,
+) -> None:
+    """Run the Whisper transcodes and write the transcript + terminal status.
+
+    Split out of `_transcribe_session` so the caller can bracket it with the
+    STATUS_TRANSCRIBING / error-rollback pair without a deep try/except around
+    the whole body. Assumes STATUS_TRANSCRIBING is already set on the session.
+    """
     def _t(path):
         return transcriber.transcribe(
             path, model_name=model_name, language="en", console=console, vad_filter=vad_filter
@@ -857,18 +1256,10 @@ def _current_recording_session_id() -> str | None:
     return sessions[0].id
 
 
-def _resolve_session_id(query: str) -> str | None:
-    """Resolve a (possibly partial) session id to a real one.
-
-    Accepts the full id ('2026-07-27_14-30-00') or any unique prefix
-    ('2026-07-27'). Returns None if nothing matches.
-    """
-    # Exact match first.
-    if session.session_dir(query).exists():
-        return query
-    # Prefix match against all session dirs.
-    matches = [s.id for s in session.list_sessions() if s.id.startswith(query)]
-    return matches[0] if matches else None
+# Re-export of session.resolve_session_id (the implementation lives in
+# session.py so the MCP server can use it without importing the CLI). Kept under
+# its private CLI name for back-compat with the existing call sites below.
+_resolve_session_id = session.resolve_session_id
 
 
 def _read_if_exists(path, label: str, *, fence: str = "```") -> str:

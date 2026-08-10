@@ -1,6 +1,6 @@
 [project]
 name = "call-copilot"
-version = "0.3.1"
+version = "0.4.0"
 description = "Call Copilot — silently record meeting audio in the background, then transcribe locally to clean markdown."
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
@@ -33,6 +33,10 @@ dependencies = [
     "rich>=13.0",
     "pydantic>=2.0",
     "numpy>=1.24",
+    # MCP server (the `rec mcp` command — exposes transcripts to Claude Code
+    # and any other MCP client over stdio). Pinned to the v2 line: the SDK API
+    # we use (from mcp.server import MCPServer) landed in 2.0.
+    "mcp>=2,<3",
 ]
 
 [project.urls]
@@ -57,6 +61,12 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Ship the single-file browser UI in the wheel + sdist. Without this, `rec web`
+# installs fine and 404s on `/` — the Homebrew formula builds from the sdist,
+# so the static file must be declared here, not relied on by "it works locally".
+[tool.setuptools.package-data]
+"rec.web" = ["static/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

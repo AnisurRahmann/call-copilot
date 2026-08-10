@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
 from rec import config, session
@@ -117,3 +118,96 @@ def test_list_sessions_ignores_non_directories(xdg, monkeypatch):
     sessions = session.list_sessions()
     assert len(sessions) == 1
     assert sessions[0].id == "2026-07-27_14-30-00"
+
+
+def test_list_sessions_ignores_stray_non_timestamp_dirs(xdg):
+    """Stray directories with non-conformant names don't surface as sessions.
+
+    Real-world cause: a tap self-test or demo fixture leaves a folder like
+    ``TAPTEST_1785841259`` or ``demo`` under the sessions root. Those sort
+    above real timestamp ids and bury the newest session, and clicking one in
+    the web UI hits the id-format guard. list_sessions filters them out so the
+    list, the CLI, the MCP server, and the web UI all agree.
+    """
+    root = config.sessions_root()
+    root.mkdir(parents=True, exist_ok=True)
+    # Two strays + one real session that should be the only thing returned.
+    for stray in ("TAPTEST_1785841259", "demo"):
+        (root / stray).mkdir()
+        (root / stray / "session.json").write_text(json.dumps({"id": stray}))
+    session.update_meta("2026-08-10_01-42-47", status=session.STATUS_TRANSCRIBED)
+    sessions = session.list_sessions()
+    assert [s.id for s in sessions] == ["2026-08-10_01-42-47"]
+
+
+def test_is_valid_session_id():
+    assert session.is_valid_session_id("2026-08-10_01-42-47")
+    # Rejected: traversal, non-timestamp shapes, empty.
+    assert not session.is_valid_session_id("demo")
+    assert not session.is_valid_session_id("TAPTEST_1785841259")
+    assert not session.is_valid_session_id("../etc/passwd")
+    assert not session.is_valid_session_id("")
+    assert not session.is_valid_session_id("2026-8-10_1-42-47")  # not zero-padded
+    # A trailing newline must not pass: Python's `$` matches before a `\n`,
+    # so the validator uses fullmatch to anchor both ends strictly.
+    assert not session.is_valid_session_id("2026-08-10_01-42-47\n")
+    assert not session.is_valid_session_id("2026-08-10_01-42-47\r")
+
+
+# ---- capture_health -------------------------------------------------------
+
+
+def _meta(**kw):
+    """Build a SessionMeta with defaults for capture_health tests."""
+    base = dict(id="2026-01-01_00-00-00", started_at="2026-01-01T00:00:00",
+                status=session.STATUS_TRANSCRIBED, duration=120.0, word_count=200)
+    base.update(kw)
+    return session.SessionMeta(**base)
+
+
+def test_capture_health_silent_status():
+    assert session.capture_health(_meta(status=session.STATUS_SILENT, duration=60, word_count=0)) == "silent"
+
+
+def test_capture_health_unknown_when_duration_or_words_missing():
+    assert session.capture_health(_meta(duration=None, word_count=None)) == "unknown"
+    assert session.capture_health(_meta(duration=120, word_count=None)) == "unknown"
+    assert session.capture_health(_meta(duration=None, word_count=200)) == "unknown"
+
+
+def test_capture_health_suspect_low_wpm_over_long_duration():
+    # 10 words over 2 minutes = 5 wpm → suspect.
+    assert session.capture_health(_meta(duration=120, word_count=10)) == "suspect"
+
+
+def test_capture_health_ok_for_normal_speech():
+    # 200 words over 2 minutes = 100 wpm → ok.
+    assert session.capture_health(_meta(duration=120, word_count=200)) == "ok"
+
+
+def test_capture_health_short_sessions_not_flagged_suspect():
+    """The duration floor stops short test recordings from tripping."""
+    # 10 words over 10s = 60 wpm anyway, but more importantly duration < 30.
+    assert session.capture_health(_meta(duration=10, word_count=2)) == "ok"
+
+
+def test_capture_health_just_under_threshold_is_suspect():
+    # 19 wpm over 60s → suspect (< 20); just above floor duration.
+    assert session.capture_health(_meta(duration=60, word_count=19)) == "suspect"
+
+
+def test_audio_sources_infers_from_wavs(xdg):
+    sid = "2026-01-01_00-00-00"
+    session.update_meta(sid, status=session.STATUS_TRANSCRIBED)
+    session.create_session_dir(sid)
+    # Neither WAV → neither source.
+    assert session.audio_sources(sid) == (False, False)
+    session.wav_path(sid).write_bytes(b"sys")
+    assert session.audio_sources(sid) == (False, True)  # (has_mic, has_system)
+    session.mic_wav_path(sid).write_bytes(b"mic")
+    assert session.audio_sources(sid) == (True, True)
+
+
+def test_silent_diagnostic_hint_is_a_nonempty_string():
+    assert isinstance(session.SILENT_DIAGNOSTIC_HINT, str)
+    assert "Screen Recording" in session.SILENT_DIAGNOSTIC_HINT

@@ -6,6 +6,7 @@ and the transcriber's whisper model are both mocked.
 
 from __future__ import annotations
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -368,6 +369,85 @@ def test_stop_transcribes_and_keeps_no_device_state(monkeypatch, cfg_written, fa
     assert session.transcript_path(sid).exists()
 
 
+def test_transcribe_sets_transcribing_status_mid_call(monkeypatch, cfg_written, fake_audio_levels):
+    """STATUS_TRANSCRIBING is on the session while the model is running.
+
+    The stubbed transcriber inspects meta on entry, before the terminal status
+    is written, so we can prove the in-flight state is observable to anyone
+    reading session.json concurrently (the web UI, or `rec status`).
+    """
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_RECORDING)
+    session.create_session_dir(sid)
+    session.wav_path(sid).write_bytes(b"RIFF...fake")
+
+    monkeypatch.setattr(recorder, "active_pid", lambda: 4321)
+    monkeypatch.setattr(recorder, "stop_recorder", lambda: (True, 4321))
+
+    seen: dict = {}
+
+    def spying_transcribe(wav, model_name="base", language="en", console=None, vad_filter=False):
+        # The recorder has stopped; transcription has started. The session must
+        # be marked transcribing before the first transcribe call returns.
+        meta = session.load_meta(sid)
+        seen["status_during"] = meta.status if meta else None
+        return TranscriptResult(
+            segments=[Segment(0.0, 12.0, "Hello world.")],
+            duration=12.0,
+            language="en",
+            language_probability=0.95,
+        )
+
+    monkeypatch.setattr(cli.transcriber, "transcribe", spying_transcribe)
+
+    res = CliRunner().invoke(cli.cli, ["stop"])
+    assert res.exit_code == 0, res.output
+    assert seen["status_during"] == session.STATUS_TRANSCRIBING
+    # And it clears to the terminal state afterwards.
+    assert session.load_meta(sid).status == session.STATUS_TRANSCRIBED
+
+
+def test_transcribe_rolls_back_to_recorded_on_error(monkeypatch, cfg_written, fake_audio_levels):
+    """A failed transcription must not leave the session stuck in TRANSCRIBING."""
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_RECORDING)
+    session.create_session_dir(sid)
+    session.wav_path(sid).write_bytes(b"RIFF...fake")
+
+    monkeypatch.setattr(recorder, "active_pid", lambda: 4321)
+    monkeypatch.setattr(recorder, "stop_recorder", lambda: (True, 4321))
+
+    def boom(wav, model_name="base", language="en", console=None, vad_filter=False):
+        raise RuntimeError("model load failed")
+
+    monkeypatch.setattr(cli.transcriber, "transcribe", boom)
+
+    res = CliRunner().invoke(cli.cli, ["stop"])
+    # The error propagates out of `main()` as a non-zero exit.
+    assert res.exit_code != 0
+    assert session.load_meta(sid).status == session.STATUS_RECORDED
+
+
+def test_status_reports_transcribing(monkeypatch, xdg):
+    """`rec status` shows in-flight transcription when no recorder is running."""
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_TRANSCRIBING)
+
+    monkeypatch.setattr(recorder, "active_pid", lambda: None)
+    res = CliRunner().invoke(cli.cli, ["status"])
+    assert res.exit_code == 0, res.output
+    assert "Transcribing" in res.output
+    assert sid in res.output
+
+
+def test_status_idle_when_not_recording_or_transcribing(monkeypatch, xdg):
+    monkeypatch.setattr(recorder, "active_pid", lambda: None)
+    res = CliRunner().invoke(cli.cli, ["status"])
+    assert res.exit_code == 0, res.output
+    assert "Not recording" in res.output
+    assert "Transcribing" not in res.output
+
+
 def test_stop_merges_mic_plus_system_transcript(monkeypatch, cfg_written, fake_transcribe, fake_audio_levels):
     """When both recording.wav and recording-mic.wav exist, the merged transcript is built."""
     sid = session.new_session_id()
@@ -568,6 +648,22 @@ def test_list_shows_sessions(monkeypatch, cfg_written, xdg):
     assert "2026-07-27 14:30" in res.output
     assert "transcribed" in res.output.lower()
     assert "4,231" in res.output
+    # The Health column header is present.
+    assert "Health" in res.output
+
+
+def test_list_shows_capture_health_column(monkeypatch, cfg_written, xdg):
+    """The health column flags suspect/silent sessions so a CLI user sees them."""
+    # A suspect session: long duration, very few words.
+    session.update_meta("2026-07-27_14-30-00", status=session.STATUS_TRANSCRIBED,
+                        duration=600.0, word_count=10, model="base")
+    # A silent session.
+    session.update_meta("2026-07-27_15-00-00", status=session.STATUS_SILENT,
+                        duration=120.0, word_count=0)
+    res = CliRunner().invoke(cli.cli, ["list"])
+    assert res.exit_code == 0, res.output
+    assert "suspect" in res.output
+    assert "silent" in res.output
 
 
 def test_list_empty(monkeypatch, cfg_written, xdg):
@@ -648,14 +744,99 @@ def test_diagnose_unknown_session_errors(cfg_written, xdg):
     assert "No session matches" in res.output
 
 
+def test_diagnose_ambiguous_prefix_errors_with_candidates(cfg_written, xdg):
+    """A prefix matching two sessions must not silently diagnose the newest."""
+    for sid in ("2026-07-27_09-00-00", "2026-07-27_14-30-00"):
+        session.create_session_dir(sid)
+        session.update_meta(sid, status=session.STATUS_RECORDED)
+    res = CliRunner().invoke(cli.cli, ["diagnose", "2026-07-27"])
+    assert res.exit_code != 0
+    assert "matches 2 sessions" in res.output
+    assert "2026-07-27_09-00-00" in res.output
+    assert "2026-07-27_14-30-00" in res.output
+
+
+@pytest.mark.parametrize("bad_id", ["../stolen", "../../etc", "/etc/passwd", ".."])
+def test_diagnose_rejects_path_traversal(cfg_written, xdg, bad_id):
+    """`rec diagnose <traversal>` must not read outside the sessions root."""
+    from rec import config
+    # Plant a victim transcript.md above the sessions root.
+    stolen = config.sessions_root().parent / "stolen"
+    stolen.mkdir(parents=True, exist_ok=True)
+    (stolen / "transcript.md").write_text("TOPSECRET", encoding="utf-8")
+    res = CliRunner().invoke(cli.cli, ["diagnose", bad_id])
+    assert res.exit_code != 0
+    assert "TOPSECRET" not in res.output
+    assert "Traceback" not in res.output  # clean error, no traceback
+
+
 # ---- group / help ---------------------------------------------------------
 
 
 def test_help_lists_all_commands():
     res = CliRunner().invoke(cli.cli, ["--help"])
     assert res.exit_code == 0
-    for cmd in ("setup", "start", "stop", "list", "status", "transcribe", "diagnose"):
+    for cmd in ("setup", "start", "stop", "list", "status", "transcribe", "diagnose",
+                "mcp", "index", "web"):
         assert cmd in res.output
+
+
+def test_mcp_help_lists_install_subcommand():
+    """`rec mcp --help` shows the `install` subcommand and the bare-server usage."""
+    res = CliRunner().invoke(cli.cli, ["mcp", "--help"])
+    assert res.exit_code == 0
+    assert "install" in res.output
+
+
+# ---- web (local browser UI) ----------------------------------------------
+
+
+def test_web_help_reads_correctly():
+    """`rec web --help` shows the port flag and the loopback-only rationale."""
+    res = CliRunner().invoke(cli.cli, ["web", "--help"])
+    assert res.exit_code == 0
+    assert "--port" in res.output
+    assert "--no-open" in res.output
+    # No --host flag is offered (loopback-only is the security model).
+    assert "--host" not in res.output
+
+
+def test_web_bypasses_envcheck(xdg, monkeypatch):
+    """`rec web` runs even where audio capture can't (it's read-mostly)."""
+    # Force envcheck to fail; the read-only gate must skip it for `web`.
+    def boom():
+        raise click.ClickException("rec only runs on macOS 14.2 or later.")
+    monkeypatch.setattr(cli.envcheck, "check_runtime", boom)
+    # Patch serve() so we don't actually start a blocking server.
+    from rec.web import server as web_server
+    called: list = []
+    monkeypatch.setattr(
+        web_server, "serve",
+        lambda port, open_browser: called.append((port, open_browser)),
+    )
+    res = CliRunner().invoke(cli.cli, ["web"])
+    assert res.exit_code == 0, res.output
+    assert called == [(7717, True)]
+
+
+def test_web_port_collision_prints_one_line(xdg, monkeypatch):
+    """An occupied port exits non-zero with a clean message, never a traceback."""
+    import socket
+
+    # Grab a port that's in use, then ask `rec web` to bind it.
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    occupied = holder.getsockname()[1]
+    try:
+        res = CliRunner().invoke(cli.cli, ["web", "--port", str(occupied), "--no-open"])
+    finally:
+        holder.close()
+    assert res.exit_code != 0
+    assert str(occupied) in res.output
+    assert "--port" in res.output
+    # No traceback: the message is a ClickException, printed as "Error: ...".
+    assert "Traceback" not in res.output
 
 
 def test_version():
@@ -665,3 +846,217 @@ def test_version():
     # break every time we bump the version.
     from rec import __version__
     assert __version__ in res.output
+
+
+# ---- mcp / index (read-only commands, bypass envcheck) ---------------------
+
+
+def test_index_command_reports_up_to_date(xdg):
+    """`rec index` with no sessions reports cleanly and creates the db."""
+    res = CliRunner().invoke(cli.cli, ["index"])
+    assert res.exit_code == 0, res.output
+    assert "index" in res.output.lower()
+
+
+def test_index_rebuild_flag_works(monkeypatch, xdg):
+    """`rec index --rebuild` indexes any on-disk transcripts."""
+    # One session with a transcript.
+    sid = "2026-07-27_14-30-00"
+    session.create_session_dir(sid)
+    session.update_meta(sid, status=session.STATUS_TRANSCRIBED)
+    session.transcript_path(sid).write_text(
+        "# Meeting Transcript\n\n---\n\nSystem [00:00] Hello world.\n"
+    )
+    res = CliRunner().invoke(cli.cli, ["index", "--rebuild"])
+    assert res.exit_code == 0, res.output
+    assert "1 session" in res.output
+
+
+def test_index_bypasses_envcheck_gate(monkeypatch, xdg):
+    """`rec index` runs even on an unsupported OS (it only reads transcripts)."""
+    from rec import envcheck
+    monkeypatch.setattr(envcheck.platform, "system", lambda: "Linux")
+    res = CliRunner().invoke(cli.cli, ["index"])
+    assert res.exit_code == 0, res.output
+    assert "macOS" not in res.output  # gate did NOT fire
+
+
+def test_index_status_reports_counts_and_orphans(xdg):
+    """`rec index --status` shows lines/sessions and flags orphan rows."""
+    # Index one real session, then delete its dir to create an orphan.
+    sid = "2026-07-27_14-30-00"
+    session.create_session_dir(sid)
+    session.update_meta(sid, status=session.STATUS_TRANSCRIBED)
+    session.transcript_path(sid).write_text(
+        "# Meeting\n\n---\n\n[00:00] Hello world.\n", encoding="utf-8")
+    from rec import index as index_mod
+    index_mod.ensure_indexed(rebuild=True)
+    import shutil
+    shutil.rmtree(session.session_dir(sid))
+
+    res = CliRunner().invoke(cli.cli, ["index", "--status"])
+    assert res.exit_code == 0, res.output
+    assert "Orphans:" in res.output
+    assert "Sessions indexed:" in res.output
+
+
+def test_mcp_status_not_wired_when_no_entry(xdg, monkeypatch):
+    """mcp_status() reports not-wired when .claude.json has no entry."""
+    # xdg returns tmp_path; use it as HOME so the real file is never touched.
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/rec")
+    st = cli.mcp_status(home=xdg)
+    assert st["wired"] is False
+    assert "rec mcp install" in st["note"]
+
+
+def test_mcp_status_wired_when_entry_matches(xdg, monkeypatch):
+    """A matching mcpServers entry reads as wired."""
+    import json as _json
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/rec")
+    expected = {"type": "stdio", "command": "/usr/local/bin/rec", "args": ["mcp"]}
+    (xdg / ".claude.json").write_text(
+        _json.dumps({"mcpServers": {"call-copilot": expected}}))
+    st = cli.mcp_status(home=xdg)
+    assert st["wired"] is True
+
+
+def test_mcp_status_command_runs(xdg, monkeypatch):
+    """The `rec mcp status` CLI command exits 0 and prints a status line."""
+    monkeypatch.setattr(cli, "mcp_status",
+                        lambda **k: {"wired": False, "path": "/x/.claude.json",
+                                     "note": "test"})
+    res = CliRunner().invoke(cli.cli, ["mcp", "status"])
+    assert res.exit_code == 0, res.output
+    assert "not wired" in res.output.lower()
+
+
+def test_mcp_bypasses_envcheck_gate(monkeypatch, xdg):
+    """`rec mcp` runs even on an unsupported OS (it only reads transcripts).
+
+    The MCP server is read-only and must work anywhere transcripts live,
+    including a non-Mac where recordings were copied in. The envcheck gate
+    (which exists to stop a doomed recording attempt) must not block it.
+    """
+    from rec import envcheck
+    monkeypatch.setattr(envcheck.platform, "system", lambda: "Linux")
+    # Stub the server launch so the test doesn't actually start the stdio loop.
+    launched = {"ran": False}
+
+    def fake_run():
+        launched["ran"] = True
+
+    monkeypatch.setattr(cli, "_run_mcp_server", fake_run)
+    res = CliRunner().invoke(cli.cli, ["mcp"])
+    assert res.exit_code == 0, res.output
+    assert launched["ran"] is True
+    assert "macOS" not in res.output  # gate did NOT fire
+
+
+def test_mcp_install_fallback_merges_claude_json(monkeypatch, xdg, tmp_path):
+    """`rec mcp install` hand-merges ~/.claude.json when `claude` CLI is absent."""
+    fake_home = tmp_path / "fakehome"
+    fake_home.mkdir()
+    monkeypatch.setattr(cli.Path, "home", lambda: fake_home)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)  # no claude on PATH
+
+    res = CliRunner().invoke(cli.cli, ["mcp", "install"])
+    assert res.exit_code == 0, res.output
+    claude_json = fake_home / ".claude.json"
+    assert claude_json.exists()
+    import json
+    data = json.loads(claude_json.read_text())
+    assert "call-copilot" in data["mcpServers"]
+    entry = data["mcpServers"]["call-copilot"]
+    assert entry["type"] == "stdio"
+    assert "command" in entry
+    # It prints the JSON block it added + a note for other clients.
+    assert "call-copilot" in res.output
+    assert "Cursor" in res.output or "cursor" in res.output.lower()
+
+
+def test_mcp_install_refuses_to_clobber_differing_entry(monkeypatch, xdg, tmp_path):
+    """A pre-existing differing `call-copilot` entry must NOT be overwritten."""
+    import json
+    fake_home = tmp_path / "fakehome"
+    fake_home.mkdir()
+    claude_json = fake_home / ".claude.json"
+    existing = {"mcpServers": {"call-copilot": {"type": "stdio", "command": "different", "args": ["x"]}}}
+    claude_json.write_text(json.dumps(existing))
+    monkeypatch.setattr(cli.Path, "home", lambda: fake_home)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+
+    res = CliRunner().invoke(cli.cli, ["mcp", "install"])
+    assert res.exit_code != 0
+    assert "clobber" in res.output.lower()
+    # The file is unchanged.
+    assert json.loads(claude_json.read_text())["mcpServers"]["call-copilot"]["command"] == "different"
+
+
+def test_mcp_install_idempotent_when_entry_matches(monkeypatch, xdg, tmp_path):
+    """Re-running install when the entry already matches is a no-op (not an error)."""
+    # First install writes the entry.
+    fake_home = tmp_path / "fakehome"
+    fake_home.mkdir()
+    monkeypatch.setattr(cli.Path, "home", lambda: fake_home)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    r1 = CliRunner().invoke(cli.cli, ["mcp", "install"])
+    assert r1.exit_code == 0, r1.output
+    # Second install should succeed (entry matches) and not clobber.
+    r2 = CliRunner().invoke(cli.cli, ["mcp", "install"])
+    assert r2.exit_code == 0, r2.output
+
+
+def test_mcp_install_uses_claude_cli_when_present(monkeypatch, xdg, tmp_path):
+    """When `claude` is on PATH, install delegates to `claude mcp add`."""
+    fake_home = tmp_path / "fakehome"
+    fake_home.mkdir()
+    monkeypatch.setattr(cli.Path, "home", lambda: fake_home)
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text("#!/bin/sh\necho 'added call-copilot'\n")
+    fake_claude.chmod(0o755)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: str(fake_claude) if name == "claude" else None)
+
+    run_calls: list = []
+    real_run = cli.subprocess.run
+
+    def capture_run(argv, **kwargs):
+        run_calls.append(argv)
+        return real_run(["sh", "-c", "echo added; exit 0"], capture_output=True, text=True)
+
+    monkeypatch.setattr(cli.subprocess, "run", capture_run)
+    res = CliRunner().invoke(cli.cli, ["mcp", "install"])
+    assert res.exit_code == 0, res.output
+    assert run_calls, "claude mcp add was not invoked"
+    argv = run_calls[0]
+    # Structure: claude mcp add call-copilot --scope <s> -- <command...>
+    assert argv[1:4] == ["mcp", "add", "call-copilot"]
+    assert "--scope" in argv
+    # The command after `--` is what the client will spawn to run the server.
+    sep = argv.index("--")
+    cmd_tail = argv[sep + 1:]
+    assert cmd_tail, "no command after --"
+    # The tail must be a real launch of the rec MCP server, not empty/garbage.
+    # _resolve_rec_command returns either [<rec>, "mcp"] or [python, "-m", "rec.mcp_server"].
+    assert cmd_tail[-1] in ("mcp", "rec.mcp_server"), f"unexpected cmd tail: {cmd_tail}"
+    assert "added" in res.output
+
+
+def test_mcp_install_claude_cli_failure_reports_clean_error(monkeypatch, xdg, tmp_path):
+    """If `claude mcp add` exits non-zero, install surfaces the error and exits non-zero."""
+    fake_home = tmp_path / "fakehome"
+    fake_home.mkdir()
+    monkeypatch.setattr(cli.Path, "home", lambda: fake_home)
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text("#!/bin/sh\nexit 0\n")
+    fake_claude.chmod(0o755)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: str(fake_claude) if name == "claude" else None)
+
+    def failing_run(argv, **kwargs):
+        return cli.subprocess.CompletedProcess(
+            argv, returncode=1, stdout="", stderr="name already exists"
+        )
+
+    monkeypatch.setattr(cli.subprocess, "run", failing_run)
+    res = CliRunner().invoke(cli.cli, ["mcp", "install"])
+    assert res.exit_code != 0
+    assert "exited 1" in res.output or "already exists" in res.output

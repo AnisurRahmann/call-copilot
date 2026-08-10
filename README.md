@@ -145,6 +145,86 @@ with `rec status`).
 > playing, or the capture permission was revoked. `rec start` (and `rec stop`) warn you
 > about this immediately, and `rec diagnose <session>` bundles the audio levels + logs.
 
+## Use your meetings from Claude Code
+
+`rec` ships an **MCP server** (the open protocol Claude Code, Cursor, Zed, Cline, and
+other AI tools speak). Point any MCP client at your locally-recorded transcripts and ask
+questions about them — answers come back with the **session id cited**, so you can check
+the exact moment. Nothing leaves your machine: the server is strictly read-only and makes
+no network calls.
+
+```bash
+rec mcp install     # writes the server entry into Claude Code's config
+```
+
+Then restart Claude Code and ask, for example:
+
+- *"What did the client actually ask for on Tuesday's call?"* — it searches the transcripts,
+  finds the line, and cites the session id (e.g. `2026-07-28_12-25-20`) with a timestamp.
+- *"List my meetings from last week with their durations."* — it lists sessions, narrowing
+  by date.
+- *"Show me the full transcript of the standup where we discussed the API migration."* — it
+  finds the session, then reads the whole transcript.
+
+Three tools are exposed: `list_sessions` (find a meeting by date), `get_session` (read a
+whole transcript), and `search_transcripts` (find specific lines across long transcripts —
+pass it **keywords** like `pricing discount`, not a full sentence). The search index lives
+at `~/.local/share/rec/index.db`; it builds lazily on first search and is a disposable cache
+— `rec index` refreshes it, `rec index --rebuild` recreates it from scratch.
+
+### Other MCP clients (Cursor, Zed, Cline, …)
+
+`rec mcp install` prints a config block that works in any MCP client. For Cursor, paste it
+into `.cursor/mcp.json`; for Zed, into `settings.json` under `mcp_servers`. It looks like:
+
+```json
+{
+  "call-copilot": {
+    "type": "stdio",
+    "command": "rec",
+    "args": ["mcp"]
+  }
+}
+```
+
+You can also run the server directly with `rec mcp` (stdio transport) if a client prefers a
+raw command.
+
+## Browser UI
+
+`rec web` opens a local browser tab — a read-mostly viewer for sessions you've
+already recorded, plus Start/Stop controls. It's modelled on the qBittorrent /
+Transmission web UI: a loopback HTTP server serves a single-page app that drives
+the **same** session store the CLI uses. The terminal can't show a live capture
+meter, a seekable audio player beside its transcript, or a session list you can
+skim in one glance — the browser can, so the UI exists for exactly those three
+things.
+
+![rec web — session list](docs/web-sessions.png)
+
+![rec web — session detail with audio and transcript](docs/web-detail.png)
+
+```bash
+rec setup            # one-time, in a terminal (the UI can't grant capture permission)
+rec web              # opens a browser tab at http://127.0.0.1:7717
+```
+
+From the tab you can browse sessions, play and seek the audio next to its
+transcript, search across every transcript, and Start/Stop a recording. Start
+calls the same recorder the CLI does; Stop queues transcription and the page
+polls until the transcript is ready. If no config is found, the Start button
+tells you to run `rec setup` in a terminal first.
+
+The server binds to `127.0.0.1` only — the host is not configurable, by design
+(a local tool must not become an open transcript server). `--port` overrides the
+default port; `--no-open` skips the automatic browser tab.
+
+> **What this is not.** The UI is still **not** a real-time transcription
+> surface — the transcript arrives after Stop, exactly as in the CLI, and there
+> is still no cloud, no sync, and no account. Every action in the browser maps
+> to a command that already exists; if a feature has no CLI equivalent, it is
+> not in the UI.
+
 ## Configuration
 
 Stored at `~/.config/rec/config.json` (XDG). Recordings live under
