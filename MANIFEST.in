@@ -7,5 +7,10 @@ include CONTRIBUTING.md
 include SECURITY.md
 include CODE_OF_CONDUCT.md
 include Makefile
+# MCP registry metadata. server.json is the official MCP Registry metadata pack
+# (registry.modelcontextprotocol.io); smithery.yaml is the Smithery build
+# descriptor. Shipping them in the sdist keeps the package self-describing.
+include server.json
+include smithery.yaml
 recursive-include docs *.md
 recursive-include .github *.yml
