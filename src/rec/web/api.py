@@ -252,17 +252,27 @@ def _stream_file_range(wfile, path, start: int, length: int) -> None:
     file size — never buffers the whole file. A read short of the declared
     ``length`` (file shrank mid-stream) is tolerated; the client simply gets a
     truncated body, which an audio player handles gracefully.
+
+    A client disconnect mid-stream (``BrokenPipeError``) is normal for media:
+    Safari's ``<audio>`` closes the connection once it has buffered enough or
+    the user seeks elsewhere. We treat that as a clean stop, not an error —
+    re-raising would make the dispatcher try to send a 500 to the same dead
+    socket, producing a cascade of noisy tracebacks for something that isn't.
     """
     remaining = length
-    with path.open("rb") as fh:
-        if start:
-            fh.seek(start)
-        while remaining > 0:
-            chunk = fh.read(min(_STREAM_CHUNK, remaining))
-            if not chunk:
-                break  # file shrank beneath us; serve what we have
-            wfile.write(chunk)
-            remaining -= len(chunk)
+    try:
+        with path.open("rb") as fh:
+            if start:
+                fh.seek(start)
+            while remaining > 0:
+                chunk = fh.read(min(_STREAM_CHUNK, remaining))
+                if not chunk:
+                    break  # file shrank beneath us; serve what we have
+                wfile.write(chunk)
+                remaining -= len(chunk)
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        # Client went away. Nothing more to write; nothing more to do.
+        log.debug("audio stream: client disconnected (%d bytes unsent)", remaining)
 
 
 def get_audio(h: WebHandler, id: str, stream: str) -> None:

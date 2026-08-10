@@ -438,6 +438,46 @@ def test_audio_mic_stream_served(web_server, xdg):
     assert body == _AUDIO[0:16]
 
 
+def test_audio_client_disconnect_mid_stream_is_not_an_error(web_server, xdg, caplog):
+    """A client that disconnects mid-stream must not log an error or cascade.
+
+    Safari's <audio> closes the connection once it has buffered enough or the
+    user seeks — that's normal, not a server fault. Before the fix this raised
+    BrokenPipeError, which the catch-all tried to 500 on the same dead socket,
+    producing a noisy traceback cascade. Now it logs at DEBUG and stops.
+    """
+    import logging
+
+    sid = _make_session_with_audio()
+    host, port = web_server
+    # Open a request, read just the headers, then abandon the connection
+    # before reading the body — exactly what a media element does on seek.
+    conn = HTTPConnection(host, port, timeout=5)
+    try:
+        conn.request(
+            "GET", f"/api/sessions/{sid}/audio/system",
+            headers={"Host": f"127.0.0.1:{port}", "Range": "bytes=0-255"},
+        )
+        resp = conn.getresponse()
+        assert resp.status == 206
+        # Read only part of the body, then hard-close (don't finish reading).
+        resp.read(2)
+    finally:
+        conn.close()  # client disconnect — server still has bytes to send
+
+    # Give the server thread a moment to hit the write-after-close.
+    import time
+    time.sleep(0.1)
+
+    # No ERROR-level log should have been produced for the disconnect.
+    errors = [
+        r for r in caplog.records
+        if r.levelno >= logging.ERROR
+        and "audio" in (r.getMessage() + " " + getattr(r, "pathname", ""))
+    ]
+    assert not errors, f"client disconnect logged as error: {[r.getMessage() for r in errors]}"
+
+
 # ---- POST /api/recording/start, /stop, retranscribe, GET /api/jobs --------
 
 
