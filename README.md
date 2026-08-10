@@ -2,7 +2,7 @@
 
 > One thing. Done really well. Record meetings. Save transcripts. Don't break audio.
 
-<!-- mcp-name: io.github.anisurrahmann/call-copilot -->
+<!-- mcp-name: io.github.AnisurRahmann/call-copilot -->
 
 Call Copilot is a terminal command (`rec`) that records your meeting audio and, when you
 stop it, transcribes locally and saves a clean markdown transcript. **Everything runs on
@@ -195,7 +195,7 @@ raw command.
 ### Official MCP Registry
 
 Call Copilot is listed on the [official MCP Registry](https://registry.modelcontextprotocol.io)
-under `io.github.anisurrahmann/call-copilot`. Any MCP client that speaks the registry can
+under `io.github.AnisurRahmann/call-copilot`. Any MCP client that speaks the registry can
 discover and add it from there. The registry entry runs the server with:
 
 ```bash
