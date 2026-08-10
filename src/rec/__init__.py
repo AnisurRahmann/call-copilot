@@ -5,4 +5,4 @@ Records system audio in the background via macOS Core Audio taps (the
 driver) and transcribes locally with faster-whisper into clean markdown.
 """
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
