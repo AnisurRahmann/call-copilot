@@ -1,0 +1,21 @@
+# Smithery configuration file. See https://smithery.ai/docs/config#smitheryyaml
+#
+# Call Copilot's MCP server is launched with `rec mcp` (stdio transport). The
+# PyPI package is `call-copilot`, but the installed command is `rec`, so the
+# server is started via `uvx --from call-copilot rec mcp` (install the package,
+# then run its `rec` entry point with the `mcp` subcommand).
+#
+# The server exposes four read-only tools (list_sessions, get_session,
+# get_summary, search_transcripts) over stdio and needs no configuration or
+# secrets — it discovers transcripts from the local `rec` data directory.
+startCommand:
+  type: stdio
+  configSchema:
+    # JSON Schema defining the configuration options for the MCP server.
+    type: object
+    required: []
+    properties: {}
+  commandFunction:
+    # A function that produces the CLI command to start the MCP server on stdio.
+    |-
+    (config) => ({ command: 'uvx', args: ['--from', 'call-copilot', 'rec', 'mcp'], env: {} })

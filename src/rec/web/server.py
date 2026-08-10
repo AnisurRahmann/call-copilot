@@ -99,11 +99,23 @@ class WebHandler(BaseHTTPRequestHandler):
             handler(self, **params)
         except _ApiError as e:
             self._send_error(e.status, e.message)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Client disconnected mid-response (common for media streams:
+            # Safari's <audio> closes the connection once it has buffered
+            # enough). This is normal — log quietly, never as an error, and
+            # crucially don't try to send a 500 to the now-dead socket.
+            log.debug("client disconnected during %s %s", method, urllib.parse.urlsplit(self.path).path)
         except Exception:  # pragma: no cover — defensive, must not leak a traceback
             # Log the path only — never self.path, which may carry a query
             # string (e.g. a search term) we deliberately keep out of the log.
             log.exception("unhandled error serving %s %s", method, urllib.parse.urlsplit(self.path).path)
-            self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Something went wrong.")
+            try:
+                self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Something went wrong.")
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # The socket died AND something else went wrong — nothing we
+                # can tell the client. Don't let this mask the original error
+                # or cascade into socketserver's noisy traceback.
+                pass
 
     # ---- DNS-rebinding guard --------------------------------------------
 
