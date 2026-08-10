@@ -1,5 +1,8 @@
 # Call Copilot
 
+[![call-copilot MCP server](https://glama.ai/mcp/servers/AnisurRahmann/call-copilot/badges/card.svg)](https://glama.ai/mcp/servers/AnisurRahmann/call-copilot)
+[![call-copilot MCP server](https://glama.ai/mcp/servers/AnisurRahmann/call-copilot/badges/score.svg)](https://glama.ai/mcp/servers/AnisurRahmann/call-copilot)
+
 > One thing. Done really well. Record meetings. Save transcripts. Don't break audio.
 
 <!-- mcp-name: io.github.AnisurRahmann/call-copilot -->
