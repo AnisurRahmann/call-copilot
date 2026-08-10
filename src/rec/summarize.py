@@ -138,8 +138,9 @@ def summarize(
     reduce_input = combined_map
     models = {"tier1": tier1_model, "tier2": None, "tier3": tier3_model}
     if tier2_model and pricing.estimate_tokens(combined_map) > reduce_budget_tokens:
-        user = template.fill_reduce(combined_map)  # consolidate reuses reduce framing
-        # For consolidation we frame it as a densification, not a final summary.
+        # Consolidate densifies the map output so the Tier 3 reduce call stays
+        # bounded. This is its own framing (not the template's reduce section) —
+        # the template's reduce section is reserved for the final Tier 3 pass.
         user = (
             "Consolidate the following per-chunk notes into fewer, denser blocks, "
             "dropping duplicates. Keep all timestamps.\n\n" + combined_map
@@ -197,13 +198,14 @@ def _call(
             tier=tier, model=model, tokens_in=c.tokens_in, tokens_out=c.tokens_out,
             cost_usd=c.cost_usd, text=c.text,
         )
-    except (ProviderError, Exception) as e:
+    except ProviderError as e:
         # An auth error (401/403) means the key is bad — retrying the remaining
         # chunks with the same key is a waste. Re-raise so the CLI surfaces it as
-        # one human line, non-zero exit. Other failures (500/timeout/network) are
-        # retried inside the transport; if they still fail after retries, mark the
-        # chunk failed and continue (the reduce pass will see the gap).
-        if isinstance(e, ProviderError) and e.status_code in (401, 403):
+        # one human line, non-zero exit. Other ProviderError failures (500/timeout
+        # after all retries) mark the chunk failed and continue — the reduce pass
+        # sees the gap. Real code bugs (TypeError/KeyError/etc.) are NOT caught
+        # here, so they propagate as tracebacks instead of being masked.
+        if e.status_code in (401, 403):
             log.warning("summarize %s AUTH FAILED (status=%s): aborting run", chunk_label, e.status_code)
             raise
         log.warning("summarize %s FAILED: %r", chunk_label, e)

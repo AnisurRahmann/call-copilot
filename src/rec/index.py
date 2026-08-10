@@ -73,8 +73,11 @@ _LINE_RE = re.compile(
 )
 
 # The header above the first `---` is metadata (Date/Duration/File/Sources),
-# not speech — skip it. We split on a line that is exactly `---`.
-_HEADER_SEP_RE = re.compile(r"(?m)^---\s*$")
+# not speech — skip it. We split on a line that is exactly `---`. Public so
+# chunking.py can reuse the same header-stripping logic (single source of truth
+# for the transcript format contract).
+HEADER_SEP_RE = re.compile(r"(?m)^---\s*$")
+_HEADER_SEP_RE = HEADER_SEP_RE  # back-compat alias for internal callers
 
 
 @dataclass

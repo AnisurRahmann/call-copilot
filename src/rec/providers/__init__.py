@@ -126,7 +126,7 @@ def _resolve_api_key(
     are set, naming the exact variable. Local providers (no key needed) get "".
     """
     preset = _PRESETS.get(name)
-    if name == "ollama" or (preset is None and is_local_base_url(api_key_env or "")):
+    if name == "ollama":
         return ""
 
     # Explicit env-var name in config/flag → that one only.

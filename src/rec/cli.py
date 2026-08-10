@@ -62,13 +62,17 @@ def prompt_yes_no(question: str, *, default: bool, timeout_s: float) -> bool:
     """Ask a yes/no question on stdin, returning ``default`` on Enter.
 
     The single function that touches stdin. It owns the KeyboardInterrupt and
-    EOFError conversions internally — a Ctrl+C at the prompt is treated as the
-    default (NOT a crash), so "at the prompt → exit 0" is achievable. Every
-    prompt test monkeypatches this.
+    EOFError conversions internally — a Ctrl+C at the prompt is treated as a
+    skip (NOT a crash), so "at the prompt → exit 0" is achievable. Every prompt
+    test monkeypatches this.
 
-    A timeout (no answer in ``timeout_s`` seconds) returns ``default`` too —
-    silence does not consent. The timeout is a seam (not a literal 60s) so tests
-    can set it to ~0.
+    Return rules (silence never consents):
+      - bare Enter (the user pressed Enter) → ``default``
+      - "y"/"yes" → True; anything else → False
+      - timeout (no answer in ``timeout_s``) → False (silence ≠ yes)
+      - Ctrl+C / closed stdin → False (skip, not a crash)
+
+    The timeout is a seam (not a literal 60s) so tests can set it to ~0.
     """
     import select
     import sys
@@ -78,13 +82,15 @@ def prompt_yes_no(question: str, *, default: bool, timeout_s: float) -> bool:
     try:
         ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
         if not ready:
-            return default  # timeout → treat as default (silence ≠ yes)
+            return False  # timeout → skip (silence never consents)
         line = sys.stdin.readline().strip().lower()
-    except (KeyboardInterrupt, EOFError):
-        # Ctrl+C / closed stdin at the prompt → default, not a crash.
-        return default
+    except (KeyboardInterrupt, EOFError, OSError, ValueError):
+        # Ctrl+C / closed stdin / non-selectable stdin (e.g. pytest capture,
+        # piped input with no fileno) → skip, not a crash. A non-selectable
+        # stdin means we can't safely prompt → never consent.
+        return False
     if line == "":
-        return default
+        return default  # bare Enter → the shown default
     return line in ("y", "yes")
 
 
@@ -163,6 +169,13 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 0
     try:
         cli.main(args=argv, standalone_mode=False, prog_name="rec")
+    except KeyboardInterrupt:
+        # A second Ctrl+C during transcription/summarisation (the first sets the
+        # stop flag; the second raises). The status rollback already happened
+        # (Commit A), so print a clean line rather than a raw traceback.
+        log.warning("interrupted by user (Ctrl-C)")
+        click.echo("Interrupted.", err=True)
+        exit_code = 130
     except click.exceptions.Abort:
         log.error("aborted by user (Ctrl-C)")
         click.echo("Aborted.", err=True)
@@ -571,11 +584,19 @@ def _maybe_prompt_summarize(
 
 
 def _run_summarize_after_transcription(cfg: config.RecConfig, session_id: str) -> None:
-    """Run the summarise pipeline after a transcription, reusing _summarize_command."""
+    """Run the summarise pipeline after a transcription, reusing _summarize_command.
+
+    ``yes=False`` so the one-time network consent ("This sends transcript text to
+    {host}. Continue?") still fires on the first real network run — the [Y/n]
+    "Summarise this meeting?" prompt is NOT informed consent for a first-ever
+    upload of meeting content (a habitual Enter on a familiar prompt is not the
+    same as acknowledging a third-party transfer). After confirmed_network is
+    set, the consent prompt stops appearing.
+    """
     _summarize_command(
         session_id, template_name="default", template_file=None,
         provider_name=None, tier1_model=None, tier2_model=None, tier3_model=None,
-        dry_run=False, force=True, yes=True, api_key_env=None,
+        dry_run=False, force=True, yes=False, api_key_env=None,
     )
 
 
@@ -1473,12 +1494,15 @@ def _run_dry_run(sid, template, pname, t1_override, t2_override, t3_override, *,
     t3_out = 3000
     t1_cost = pricing.cost(t1, t1_in, t1_out)
     t3_cost = pricing.cost(t3, t3_in, t3_out)
+    # Unknown model → None → treat as 0 for the estimate (the real cost line
+    # will say "cost unknown"; the dry-run just needs a planning number).
     est = (t1_cost or 0.0) + (t3_cost or 0.0)
+    priced = t1_cost is not None and t3_cost is not None
 
     click.echo(f"Session: {sid}")
     click.echo(f"Chunks: {len(chunks)} (target ~6k tokens each, ceiling 8k)")
     click.echo(f"Estimated tokens: ~{total_tokens:,} transcript → ~{t1_in + t1_out:,} tier-1, ~{t3_in + t3_out:,} tier-3")
-    label = f"~${est:.2g}" if est else "$0.00" if est == 0.0 else "cost unknown"
+    label = f"~${est:.2g}" if priced and est > 0 else ("$0.00" if est == 0.0 else "cost unknown (model not in price table)")
     click.echo(f"Estimated cost: {label}  ({t1} → {t3})")
     if pname:
         click.echo(f"Provider: {pname}")

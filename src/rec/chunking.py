@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .index import _HEADER_SEP_RE
+from .index import HEADER_SEP_RE
 from .providers import pricing
 
 TARGET_TOKENS = 6_000
@@ -47,7 +47,7 @@ class Chunk:
 
 def strip_header(text: str) -> str:
     """Drop the markdown header (everything up to/including the first ``---``)."""
-    splits = _HEADER_SEP_RE.split(text, maxsplit=1)
+    splits = HEADER_SEP_RE.split(text, maxsplit=1)
     # splits == [header, body] when a separator is present; else [whole text].
     body = splits[1] if len(splits) == 2 else text
     return body.strip()

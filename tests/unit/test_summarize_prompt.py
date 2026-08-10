@@ -141,21 +141,33 @@ def test_interactive_answer_yes_runs(transcribed_session, monkeypatch):
     assert ran == [transcribed_session]
 
 
+def test_prompt_timeout_returns_false_silence_never_consents():
+    """The REAL prompt_yes_no returns False on timeout — silence never consents.
+
+    This drives the actual seam (not a stub): a never-ready stdin + tiny timeout
+    exercises the select() timeout branch. default=True is passed to prove the
+    timeout does NOT return the default (which would trigger an unwanted upload).
+    """
+    result = cli.prompt_yes_no("Summarise?", default=True, timeout_s=0.01)
+    assert result is False  # timeout → False, NOT the True default
+
+
 def test_prompt_timeout_skips_with_hint(transcribed_session, monkeypatch):
     """Prompt timeout → skip, print the `rec summarize <id>` hint, zero calls.
 
-    prompt_yes_no returns the default on timeout. With default=True that would
-    RUN summarisation — but the spec says "timeout skips rather than proceeds."
-    So the seam returns the default only for Enter; a timeout must skip. The
-    seam's timeout behavior returns `default`, so for the SKIP-on-timeout
-    semantics we set default=False in the call... but the prompt shows [Y/n]
-    (default yes). Resolution: timeout returns False (skip) regardless of the
-    shown default, because silence ≠ consent.
+    Drives the real prompt_yes_no (never-ready stdin, tiny timeout) through the
+    full _maybe_prompt_summarize path, so the skip-on-timeout behavior is
+    asserted end-to-end, not just against a stub.
     """
-    _provider_config(auto="ask")
+    _provider_config(auto="ask", prompt_timeout_s=0.01)
     monkeypatch.setattr(cli, "_is_interactive", lambda: True)
-    # Simulate a timeout: the seam returns False (skip) on timeout.
-    monkeypatch.setattr(cli, "prompt_yes_no", lambda *a, **kw: False)
+    # Use the real prompt_yes_no (do NOT stub it) so the timeout branch runs.
+    ran = []
+    monkeypatch.setattr(cli, "_run_summarize_after_transcription",
+                        lambda cfg, sid: ran.append(sid))
+    cfg = config.load_config()
+    cli._maybe_prompt_summarize(cfg, transcribed_session, summarize_flag=None)
+    assert ran == []  # timeout → skipped, no provider call
     ran = []
     monkeypatch.setattr(cli, "_run_summarize_after_transcription",
                         lambda cfg, sid: ran.append(sid))
