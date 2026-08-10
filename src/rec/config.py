@@ -67,6 +67,11 @@ class RecConfig(BaseModel):
     # Reserved for future "system+mic" capture. Today only "system" is wired.
     capture: str = "mic+system"
     sessions_dir: Path = Field(default_factory=sessions_root)
+    # Summarisation settings (Step 3). A dict (not a nested model) so unknown
+    # keys are tolerated and so we never accidentally persist an api_key here —
+    # the rule is keys live in env vars only; config stores the env var NAME.
+    # Empty dict = summarisation not configured (offline by default).
+    summarize: dict = Field(default_factory=dict)
 
     @field_validator("sessions_dir", mode="before")
     @classmethod
@@ -83,13 +88,20 @@ class RecConfig(BaseModel):
         sessions = str(self.sessions_dir)
         if sessions.startswith(home):
             sessions = "~" + sessions[len(home):]
-        return {
+        out = {
             "sample_rate": self.sample_rate,
             "channels": self.channels,
             "whisper_model": self.whisper_model,
             "capture": self.capture,
             "sessions_dir": sessions,
         }
+        if self.summarize:
+            # Never persist an api_key value (defense in depth — it should never
+            # be set, but a stray key in a copied config is the one leak we guard
+            # against by construction).
+            s = {k: v for k, v in self.summarize.items() if k != "api_key"}
+            out["summarize"] = s
+        return out
 
 
 def default_config() -> RecConfig:

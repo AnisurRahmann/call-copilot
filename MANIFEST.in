@@ -14,3 +14,5 @@ include server.json
 include smithery.yaml
 recursive-include docs *.md
 recursive-include .github *.yml
+# Ship the prompt templates so a Homebrew/sdist install can summarise.
+recursive-include src/rec/prompts *.md

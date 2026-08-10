@@ -361,3 +361,23 @@ def test_stats_on_empty_store_is_zero(xdg):
     assert st.sessions == 0
     assert st.last_indexed_at is None
     assert st.orphans == 0
+
+
+def test_indexer_reads_only_transcript_filename(xdg):
+    """The indexer must index transcript.md only — never summary.md.
+
+    This is the load-bearing invariant behind the whole file-layout decision:
+    if summary text entered the indexed file, search_transcripts would return
+    hits on model-generated text and the agent would cite it as something said
+    on the call. Manufactured quotes inside a meeting record is the worst
+    failure this product can have. (See STEP3_SUMMARIES.md §10.)
+    """
+    from pathlib import Path
+
+    src = Path(index.__file__).read_text(encoding="utf-8")
+    # The indexer must reference TRANSCRIPT_FILENAME, and must NOT reference
+    # SUMMARY_FILENAME or the literal "summary.md".
+    assert "TRANSCRIPT_FILENAME" in src or "transcript.md" in src
+    assert "SUMMARY_FILENAME" not in src
+    assert "summary.md" not in src
+

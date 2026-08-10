@@ -206,7 +206,7 @@ def test_start_default_enters_live_ui_then_finishes(monkeypatch, cfg_written, fa
     # Stub the live UI so the test doesn't actually block — it records that it
     # was called with the right session, then simulates a clean stop.
     live_calls: list = []
-    def fake_live(cfg, sid, *, model_override, vad_filter):
+    def fake_live(cfg, sid, *, model_override, vad_filter, summarize_flag=None):
         live_calls.append((sid, model_override, vad_filter))
     monkeypatch.setattr(cli, "_run_live_recording", fake_live)
 
@@ -424,6 +424,34 @@ def test_transcribe_rolls_back_to_recorded_on_error(monkeypatch, cfg_written, fa
 
     res = CliRunner().invoke(cli.cli, ["stop"])
     # The error propagates out of `main()` as a non-zero exit.
+    assert res.exit_code != 0
+    assert session.load_meta(sid).status == session.STATUS_RECORDED
+
+
+def test_transcribe_rolls_back_on_keyboard_interrupt(monkeypatch, cfg_written, fake_audio_levels):
+    """Ctrl+C during transcription must not wedge the session at TRANSCRIBING.
+
+    KeyboardInterrupt is a BaseException, not an Exception, so the rollback
+    guard in _transcribe_session used to miss it (it caught only ``Exception``).
+    The session then stayed STATUS_TRANSCRIBING forever and poisoned
+    ``rec status`` via _transcribing_session. The fix widens the catch to
+    BaseException; this test pins that a Ctrl+C behaves like any other
+    transcription failure — status rolled back to RECORDED, non-zero exit.
+    """
+    sid = session.new_session_id()
+    session.update_meta(sid, status=session.STATUS_RECORDING)
+    session.create_session_dir(sid)
+    session.wav_path(sid).write_bytes(b"RIFF...fake")
+
+    monkeypatch.setattr(recorder, "active_pid", lambda: 4321)
+    monkeypatch.setattr(recorder, "stop_recorder", lambda: (True, 4321))
+
+    def ctrl_c(wav, model_name="base", language="en", console=None, vad_filter=False):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.transcriber, "transcribe", ctrl_c)
+
+    res = CliRunner().invoke(cli.cli, ["stop"])
     assert res.exit_code != 0
     assert session.load_meta(sid).status == session.STATUS_RECORDED
 
