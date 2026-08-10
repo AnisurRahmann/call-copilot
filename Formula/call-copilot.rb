@@ -31,8 +31,8 @@ class CallCopilot < Formula
   homepage "https://github.com/AnisurRahmann/call-copilot"
   # The sdist is the formula's hash-verified source (so Homebrew can version +
   # audit it). The actual install fetches the wheel from PyPI by name.
-  url "https://files.pythonhosted.org/packages/7b/cf/0c717f7f057d2841f7906ba86ba17b981963b712ae187c1a5d5eeff79749/call_copilot-0.4.0.tar.gz"
-  sha256 "a72cd4f6687b5ef1293bcee27114d5472dc2b381918727b622b82f7e2510931e"
+  url "https://files.pythonhosted.org/packages/ca/44/ab2191f7a685f1ef08cc819740d077032c9b391c8345956a2c9fa769b0d7/call_copilot-0.4.1.tar.gz"
+  sha256 "ad8ea371f8047c69e1fc3da823fec5e94b072a8ac18751cf011c022c6513c305"
   license "MIT"
   head "https://github.com/AnisurRahmann/call-copilot.git", branch: "main"
 
