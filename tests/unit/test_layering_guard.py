@@ -60,9 +60,13 @@ def test_web_module_imports_no_heavy_deps(path: Path) -> None:
 
 
 def test_mcp_server_imports_neither_recorder_nor_web() -> None:
-    """The read-only MCP server must not import the recording machinery or web UI."""
+    """The read-only MCP server must not import recording, web, or summarisation.
+
+    Summarise/providers generate text and make network calls — the read-only
+    server must never reach them.
+    """
     src = (SRC / "mcp_server.py").read_text(encoding="utf-8")
-    for forbidden in ("recorder", "transcriber", "audio_check", "web"):
+    for forbidden in ("recorder", "transcriber", "audio_check", "web", "summarize", "providers"):
         assert f"from . import {forbidden}" not in src
         assert f"import {forbidden}" not in src
 

@@ -71,7 +71,7 @@ def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
     # transcripts on disk and have nothing to do with audiotap/Core Audio, so
     # they must run on any machine that has transcripts to read (including a
     # non-Mac where recordings were copied in, or in CI).
-    _READ_ONLY_COMMANDS = {"mcp", "index", "web"}
+    _READ_ONLY_COMMANDS = {"mcp", "index", "web", "summarize"}
     if ctx.invoked_subcommand not in _READ_ONLY_COMMANDS:
         envcheck.check_runtime()
     _setup_logging_for_run(verbose, quiet, ctx.invoked_subcommand)
@@ -1104,6 +1104,260 @@ def index(rebuild: bool, show_status: bool) -> None:
         click.echo("Index is up to date (0 sessions needed reindexing).")
     db = index_mod.index_path()
     click.echo(f"Index: {db}")
+
+
+# ---- summarize (Step 3) ---------------------------------------------------
+
+
+@cli.command()
+@click.argument("session_id")
+@click.option("--template", "template_name", default="default", show_default=True,
+              help="Built-in or user prompt template name (default/standup/client-call/...).")
+@click.option("--template-file", "template_file", default=None,
+              help="Path to a custom .md template file (overrides --template).")
+@click.option("--provider", "provider_name", default=None,
+              help="Provider preset (glm/glm-anthropic/anthropic/gemini/deepseek/ollama/openai-compat).")
+@click.option("--tier1", "tier1_model", default=None, help="Tier 1 (map) model override.")
+@click.option("--tier2", "tier2_model", default=None, help="Tier 2 (consolidate) model override.")
+@click.option("--tier3", "tier3_model", default=None, help="Tier 3 (reduce) model override.")
+@click.option("--dry-run", is_flag=True,
+              help="Print chunk count, estimated tokens, and estimated cost — zero network calls.")
+@click.option("--force", is_flag=True, help="Overwrite an existing summary.md.")
+@click.option("--yes", is_flag=True, help="Skip the one-time network consent prompt.")
+@click.option("--api-key-env", "api_key_env", default=None,
+              help="Name of the env var holding the API key (overrides summarize.api_key_env).")
+def summarize(
+    session_id: str, template_name: str, template_file: str | None,
+    provider_name: str | None, tier1_model: str | None, tier2_model: str | None,
+    tier3_model: str | None, dry_run: bool, force: bool, yes: bool, api_key_env: str | None,
+) -> None:
+    """Summarise a session's transcript → summary.md using your own API key.
+
+    BYOK and offline by default: with no provider configured this errors with a
+    one-line setup instruction and never makes a network call. The first network
+    run asks once before sending transcript text; --yes skips that. The summary
+    goes to summary.md next to the transcript; transcript.md is never modified.
+
+    --dry-run prints the chunk count, estimated tokens per tier, and estimated
+    cost with ZERO network calls — use it to see what a run will cost first.
+    """
+    _summarize_command(
+        session_id, template_name=template_name, template_file=template_file,
+        provider_name=provider_name, tier1_model=tier1_model, tier2_model=tier2_model,
+        tier3_model=tier3_model, dry_run=dry_run, force=force, yes=yes,
+        api_key_env=api_key_env,
+    )
+
+
+def _summarize_command(
+    session_id: str, *, template_name: str, template_file: str | None,
+    provider_name: str | None, tier1_model: str | None, tier2_model: str | None,
+    tier3_model: str | None, dry_run: bool, force: bool, yes: bool,
+    api_key_env: str | None,
+) -> None:
+    """Implementation of `rec summarize` (split out for testability)."""
+    from . import summarize as summarize_mod
+    from . import templates as templates_mod
+    from .providers import NoProviderError, consent_host, is_local_provider, make_provider
+
+    log_mod.set_session_context(session_id)
+
+    # Resolve the session (partial ids allowed).
+    try:
+        resolved = session.resolve_session_id(session_id)
+    except session.AmbiguousSessionId as e:
+        raise click.ClickException(f"{e} Run `rec list` to see session ids.") from e
+    if resolved is None:
+        raise click.ClickException(
+            f"No session matches {session_id!r}. Run `rec list` to see session ids."
+        )
+    if resolved != session_id:
+        click.echo(f"(matched session {resolved})")
+    sid = resolved
+
+    tpath = session.transcript_path(sid)
+    if not tpath.exists():
+        raise click.ClickException(
+            f"Session {sid} has no transcript (transcribe it first with `rec transcribe {sid}`)."
+        )
+
+    # Guard: don't silently overwrite an existing summary.
+    if session.summary_path(sid).exists() and not force:
+        raise click.ClickException(
+            f"Summary already exists for {sid}: {session.summary_path(sid)}. "
+            "Pass --force to overwrite."
+        )
+
+    # Load template (file override wins).
+    try:
+        template = (
+            templates_mod.load_template_file(template_file)
+            if template_file
+            else templates_mod.load_template(template_name)
+        )
+    except templates_mod.TemplateError as e:
+        raise click.ClickException(str(e)) from e
+
+    cfg = config.load_config()
+    summ = dict(cfg.summarize or {})
+    pname = provider_name or summ.get("provider")
+    base_url = summ.get("base_url")
+    key_env = api_key_env or summ.get("api_key_env")
+
+    # --- dry run: chunking + estimates only, zero network ---
+    if dry_run:
+        return _run_dry_run(sid, template, pname, tier1_model, tier2_model, tier3_model,
+                            summ=summ)
+
+    # No provider configured → one-line error (offline by default).
+    if not pname:
+        raise click.ClickException(
+            "No summarisation provider configured. Set `summarize.provider` (e.g. \"glm\") "
+            "and the relevant API-key env var in your config, then re-run. "
+            "Run `rec setup` first if you have no config. "
+            "(Example: export ZAI_API_KEY=... and add a \"summarize\": {\"provider\": \"glm\"} block.)"
+        )
+
+    # Resolve models per tier (config → defaults per provider).
+    t1 = tier1_model or summ.get("tier1_model") or "glm-4.7-flash"
+    t2 = tier2_model if tier2_model is not None else summ.get("tier2_model")
+    t3 = tier3_model or summ.get("tier3_model") or "glm-5"
+
+    # One-time network consent (local providers never prompt).
+    local = is_local_provider(pname, base_url)
+    if not local and not summ.get("confirmed_network") and not yes:
+        host = consent_host(name=pname, base_url=base_url)
+        if not _confirm_network(host):
+            click.echo("Summarise cancelled.")
+            return
+        summ["confirmed_network"] = True
+        _persist_summarize_block(cfg, summ)
+
+    # Construct the provider (resolves the key from the env var).
+    try:
+        provider = make_provider(name=pname, api_key_env=key_env, base_url=base_url)
+    except NoProviderError as e:
+        raise click.ClickException(str(e)) from e
+
+    # The transcript is never modified by summarisation — summary text goes to
+    # summary.md only. The byte-identical invariant is pinned by test #13.
+    try:
+        result = summarize_mod.summarize(
+            session_id=sid, provider=provider, template=template,
+            tier1_model=t1, tier2_model=t2, tier3_model=t3,
+        )
+    except summarize_mod.ProviderError as e:
+        # Auth/transport error the orchestrator chose to surface (401/403).
+        # Render as one human line, non-zero exit — never a traceback.
+        raise click.ClickException(e.message) from e
+    except KeyboardInterrupt:
+        # Abort summarisation only: transcript intact, exit 0.
+        _print_cost_line_from_calls(sid, [], elapsed=0.0)
+        click.echo("Summarise interrupted. Transcript is intact.")
+        return
+
+    # Record summary metadata on the session (no key, no text).
+    session.update_meta(sid, summary=result.to_meta(template.name, pname))
+
+    click.echo(f"Summary: {result.out_path}")
+    _print_cost_line(result)
+    if result.partial:
+        click.secho(
+            "Note: the reduce pass did not complete; partial map output written to "
+            f"{result.out_path.name}.",
+            fg="yellow", err=True,
+        )
+
+
+def _run_dry_run(sid, template, pname, t1_override, t2_override, t3_override, *, summ):
+    """Print chunk count, estimated tokens, and estimated cost. Zero network."""
+    from . import chunking as chunking_mod
+    from .providers import pricing
+
+    transcript = session.transcript_path(sid).read_text(encoding="utf-8")
+    chunks = chunking_mod.chunk_transcript(transcript)
+    if not chunks:
+        raise click.ClickException(f"No transcript lines to summarise in {sid}.")
+
+    total_tokens = chunking_mod.total_estimate(chunks)
+    t1 = t1_override or summ.get("tier1_model") or "glm-4.7-flash"
+    t3 = t3_override or summ.get("tier3_model") or "glm-5"
+
+    # Rough cost: estimate Tier 1 as `total_tokens` in, ~2k out across chunks;
+    # Tier 3 as a few k in, ~4k out. This is a planning number, not a promise.
+    t1_in = total_tokens
+    t1_out = len(chunks) * 1500
+    t3_in = min(total_tokens // 3, 12_000)
+    t3_out = 3000
+    t1_cost = pricing.cost(t1, t1_in, t1_out)
+    t3_cost = pricing.cost(t3, t3_in, t3_out)
+    est = (t1_cost or 0.0) + (t3_cost or 0.0)
+
+    click.echo(f"Session: {sid}")
+    click.echo(f"Chunks: {len(chunks)} (target ~6k tokens each, ceiling 8k)")
+    click.echo(f"Estimated tokens: ~{total_tokens:,} transcript → ~{t1_in + t1_out:,} tier-1, ~{t3_in + t3_out:,} tier-3")
+    label = f"~${est:.2g}" if est else "$0.00" if est == 0.0 else "cost unknown"
+    click.echo(f"Estimated cost: {label}  ({t1} → {t3})")
+    if pname:
+        click.echo(f"Provider: {pname}")
+    else:
+        click.echo("Provider: (none configured — set summarize.provider to run for real)")
+    click.echo("(dry run — zero network calls)")
+
+
+def _confirm_network(host: str) -> bool:
+    """The one-time network-consent prompt. Local providers never reach here."""
+    # `click.confirm` with default=False so a blind Enter does NOT consent.
+    return click.confirm(
+        f"This sends transcript text to {host}. Continue?",
+        default=False,
+    )
+
+
+def _persist_summarize_block(cfg: config.RecConfig, summ: dict) -> None:
+    """Persist the (possibly updated) summarize block back to config.json."""
+    cfg.summarize = summ
+    config.save_config(cfg)
+
+
+def _print_cost_line(result) -> None:
+    """Render the real cost line: `summary: $X — N tier-1 (model), ...`."""
+    models = result.models
+    calls = result.calls
+    toks = result.tokens
+
+    def _cost_str() -> str:
+        if result.cost_usd is None:
+            return "cost unknown (model not in price table)"
+        if result.cost_estimated:
+            return f"~${result.cost_usd:.2g} (estimated — provider reported no usage)"
+        return f"${result.cost_usd:.4f}"
+
+    t1m = models.get("tier1") or "?"
+    t2m = models.get("tier2")
+    t3m = models.get("tier3") or "?"
+    tier2_part = f", {calls.get('tier2', 0)} tier-2" + (f" ({t2m})" if t2m else "")
+    click.echo(
+        f"summary: {_cost_str()} — {calls.get('tier1', 0)} tier-1 calls ({t1m})"
+        f"{tier2_part}, {calls.get('tier3', 0)} tier-3 call ({t3m}), "
+        f"{_fmt_tok(toks.get('in', 0))} in / {_fmt_tok(toks.get('out', 0))} out, "
+        f"{result.wall_clock_s:.0f}s"
+    )
+
+
+def _print_cost_line_from_calls(sid, calls, *, elapsed: float) -> None:
+    """Print a cost line for a run that didn't complete the normal path."""
+    if not calls:
+        return
+    # Best-effort: aggregate what we have.
+    click.echo(f"summary (partial): see summary.partial.md — {elapsed:.0f}s")
+
+
+def _fmt_tok(n: int) -> str:
+    """Render a token count as e.g. `38.2k`."""
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
 
 
 # ---- shared transcription helper ------------------------------------------

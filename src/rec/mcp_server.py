@@ -178,8 +178,10 @@ def list_sessions(
 
     Returns, per session: `id` (cite this), `started_at`, `duration_seconds`,
     `duration_human`, `size_bytes` (audio on disk), `word_count`,
-    `has_transcript`, and `source` ("mic" / "system" / "both"). Sessions with
-    `has_transcript=false` have no searchable text (silent or recording-only).
+    `has_transcript`, `has_summary`, and `source` ("mic" / "system" / "both").
+    Sessions with `has_transcript=false` have no searchable text (silent or
+    recording-only). `has_summary=true` means a `summary.md` exists for that
+    session — call `get_summary` to read it.
     """
     sessions = session.list_sessions()  # newest-first already
     out: list[dict] = []
@@ -188,6 +190,7 @@ def list_sessions(
         if not _within_window(started, before, after):
             continue
         has_t = session.transcript_path(m.id).exists()
+        has_s = session.summary_path(m.id).exists()
         out.append(
             {
                 "id": m.id,
@@ -197,6 +200,7 @@ def list_sessions(
                 "size_bytes": _session_size_bytes(m.id),
                 "word_count": m.word_count,
                 "has_transcript": has_t,
+                "has_summary": has_s,
                 "source": _session_source(m.id),
                 "status": m.status,
             }
@@ -221,8 +225,9 @@ def get_session(
     rest of the CLI does ('2026-07-27' matches '2026-07-27_14-30-00').
 
     Returns the session's metadata plus, when `include_transcript=true` (the
-    default), the complete `transcript` text. Raises a tool error (visible to
-    the model) if no session matches or it has no transcript.
+    default), the complete `transcript` text. Also returns `has_summary`, so you
+    know whether `get_summary` will have something to return. Raises a tool
+    error (visible to the model) if no session matches or it has no transcript.
     """
     resolved = session.resolve_session_id(id)
     if resolved is None:
@@ -232,6 +237,7 @@ def get_session(
     meta = session.load_meta(resolved)
     tpath = session.transcript_path(resolved)
     has_t = tpath.exists()
+    has_s = session.summary_path(resolved).exists()
     transcript_text: str | None = None
     if include_transcript:
         if not has_t:
@@ -257,10 +263,60 @@ def get_session(
         "source": _session_source(resolved),
         "status": meta.status if meta else None,
         "has_transcript": has_t,
+        "has_summary": has_s,
     }
     if transcript_text is not None:
         result["transcript"] = transcript_text
     return result
+
+
+def get_summary(
+    id: Annotated[str, Field(description="Session id or a unique prefix (e.g. '2026-07-27').")],
+) -> dict:
+    """Read the summary of one session, if one was generated.
+
+    Returns the ``summary`` text plus its provenance (provider, models, cost,
+    when it was generated) when a ``summary.md`` exists. If there is no summary
+    yet, returns a clear message pointing to ``rec summarize <id>``.
+
+    This tool is read-only: it reads ``summary.md`` off disk. It cannot generate
+    a summary, mutate one, or make a network call. To generate one, the user
+    runs ``rec summarize <id>`` in their terminal.
+    """
+    resolved = session.resolve_session_id(id)
+    if resolved is None:
+        raise ValueError(
+            f"No session matches {id!r}. Call list_sessions to see session ids."
+        )
+    spath = session.summary_path(resolved)
+    if not spath.exists():
+        return {
+            "id": resolved,
+            "has_summary": False,
+            "summary": None,
+            "message": (
+                f"No summary yet for {resolved}. Run `rec summarize {resolved}` "
+                "(after configuring a provider) to generate one."
+            ),
+        }
+    try:
+        text = spath.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise ValueError(f"Could not read summary for {resolved}: {e}") from e
+
+    meta = session.load_meta(resolved)
+    summary_meta = meta.summary if (meta and meta.summary) else {}
+    log.info("get_summary %s -> %s (summary present)", id, resolved)
+    return {
+        "id": resolved,
+        "has_summary": True,
+        "summary": text,
+        "provider": summary_meta.get("provider"),
+        "template": summary_meta.get("template"),
+        "models": summary_meta.get("models"),
+        "cost_usd": summary_meta.get("cost_usd"),
+        "generated_at": summary_meta.get("generated_at"),
+    }
 
 
 def search_transcripts(
@@ -407,6 +463,7 @@ def build_server():  # -> mcp.server.MCPServer (typed loosely to keep import laz
 
     mcp.tool(name="list_sessions", annotations=read_only)(list_sessions)
     mcp.tool(name="get_session", annotations=read_only)(get_session)
+    mcp.tool(name="get_summary", annotations=read_only)(get_summary)
     mcp.tool(name="search_transcripts", annotations=read_only)(search_transcripts)
     return mcp
 

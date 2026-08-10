@@ -24,6 +24,7 @@ RECORDING_FILENAME = "recording.wav"          # system audio
 MIC_RECORDING_FILENAME = "recording-mic.wav"  # microphone
 SESSION_META_FILENAME = "session.json"
 TRANSCRIPT_FILENAME = "transcript.md"
+SUMMARY_FILENAME = "summary.md"
 
 
 class InvalidSessionId(ValueError):
@@ -119,6 +120,11 @@ def transcript_path(session_id: str) -> Path:
     return session_dir(session_id) / TRANSCRIPT_FILENAME
 
 
+def summary_path(session_id: str) -> Path:
+    """Path to a session's summary file (written by `rec summarize`)."""
+    return session_dir(session_id) / SUMMARY_FILENAME
+
+
 def audio_sources(session_id: str) -> tuple[bool, bool]:
     """Which audio sources a session captured, inferred from which WAVs exist.
 
@@ -146,6 +152,9 @@ class SessionMeta:
     duration: float | None = None  # seconds
     word_count: int | None = None
     model: str | None = None
+    # Populated by `rec summarize` on success: provider, models, calls, tokens,
+    # cost. No key material, no transcript/summary text (see STEP3_SUMMARIES.md).
+    summary: dict = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:

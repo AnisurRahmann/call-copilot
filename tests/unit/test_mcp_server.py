@@ -94,7 +94,7 @@ def test_list_sessions_includes_all_documented_fields(sessions):
     s = out[0]
     for key in (
         "id", "started_at", "duration_seconds", "duration_human", "size_bytes",
-        "word_count", "has_transcript", "source", "status",
+        "word_count", "has_transcript", "has_summary", "source", "status",
     ):
         assert key in s, f"missing field {key!r}"
 
@@ -171,6 +171,7 @@ def test_get_session_omits_transcript_when_flag_false(sessions):
     out = mcp_server.get_session("2026-07-28", include_transcript=False)
     assert "transcript" not in out
     assert out["has_transcript"] is True
+    assert out["has_summary"] is False  # no summary written yet
 
 
 def test_get_session_missing_raises_value_error(sessions):
@@ -217,6 +218,58 @@ def test_get_session_without_transcript_raises_when_requested(xdg):
     # ...but works fine without the transcript body.
     out = mcp_server.get_session("2026-07-30", include_transcript=False)
     assert out["has_transcript"] is False
+
+
+# ---- has_summary + get_summary --------------------------------------------
+
+
+def test_has_summary_false_in_list_and_get_when_no_summary(sessions):
+    """Without a summary.md, has_summary is False everywhere."""
+    for s in mcp_server.list_sessions(limit=10):
+        assert s["has_summary"] is False
+    out = mcp_server.get_session("2026-07-28", include_transcript=False)
+    assert out["has_summary"] is False
+
+
+def test_has_summary_true_when_summary_md_exists(sessions):
+    """A summary.md on disk flips has_summary to True in both tools."""
+    sid = "2026-07-28_12-25-20"
+    session.summary_path(sid).write_text("# Summary\n\nDecisions made.", encoding="utf-8")
+    listed = {s["id"]: s for s in mcp_server.list_sessions(limit=10)}
+    assert listed[sid]["has_summary"] is True
+    got = mcp_server.get_session(sid, include_transcript=False)
+    assert got["has_summary"] is True
+
+
+def test_get_summary_returns_file_when_present(sessions):
+    """get_summary reads summary.md and returns its text + provenance."""
+    sid = "2026-07-28_12-25-20"
+    session.summary_path(sid).write_text("# Summary\n\nKey decisions here.", encoding="utf-8")
+    out = mcp_server.get_summary(sid)
+    assert out["has_summary"] is True
+    assert "Key decisions here." in out["summary"]
+    assert out["id"] == sid
+
+
+def test_get_summary_absent_returns_clear_message(sessions):
+    """No summary → a clear message pointing at `rec summarize`, not an error."""
+    out = mcp_server.get_summary("2026-07-28_12-25-20")
+    assert out["has_summary"] is False
+    assert out["summary"] is None
+    assert "rec summarize" in out["message"]
+
+
+def test_get_summary_missing_session_raises(sessions):
+    with pytest.raises(ValueError, match="list_sessions"):
+        mcp_server.get_summary("does-not-exist")
+
+
+def test_get_summary_never_creates_a_file(sessions):
+    """get_summary is read-only — it must never write summary.md."""
+    sid = "2026-07-28_12-25-20"
+    assert not session.summary_path(sid).exists()
+    mcp_server.get_summary(sid)  # absent
+    assert not session.summary_path(sid).exists()
 
 
 # ---- path traversal (security) ---------------------------------------------
@@ -361,10 +414,10 @@ def _registered_tools():
     return asyncio.run(mcp.list_tools())
 
 
-def test_server_registers_exactly_three_tools():
+def test_server_registers_exactly_four_tools():
     tools = _registered_tools()
     names = sorted(t.name for t in tools)
-    assert names == ["get_session", "list_sessions", "search_transcripts"]
+    assert names == ["get_session", "get_summary", "list_sessions", "search_transcripts"]
 
 
 def test_all_tools_are_marked_read_only():
@@ -402,7 +455,7 @@ def test_tool_descriptions_mention_the_discovery_chain():
 
 def test_tool_functions_have_introspectable_signatures():
     """The underlying functions (not just the server bindings) keep real params."""
-    for name in ("list_sessions", "get_session", "search_transcripts"):
+    for name in ("list_sessions", "get_session", "get_summary", "search_transcripts"):
         fn = getattr(mcp_server, name)
         sig = inspect.signature(fn)
         kinds = {p.kind for p in sig.parameters.values()}
@@ -422,15 +475,16 @@ def test_mcp_server_module_does_not_import_recorder():
     """The read-only server must not import the recording machinery or the web UI.
 
     `rec.mcp_server` is strictly read-only and never imports `recorder` (audio
-    capture), `transcriber` (the model), `audio_check` (silence analysis), or
-    `rec.web` (the mutating browser UI). This is what lets the MCP server run
-    anywhere transcripts exist, on machines that can't record. The guard is a
-    source check so a future edit can't quietly add a dependency; the
-    end-to-end check is test_handshake_stdout_is_pure.
+    capture), `transcriber` (the model), `audio_check` (silence analysis),
+    `rec.web` (the mutating browser UI), or the summarisation modules
+    (`summarize`, `providers`) — those generate and make network calls. This is
+    what lets the MCP server run anywhere transcripts exist, on machines that
+    can't record. The guard is a source check so a future edit can't quietly add
+    a dependency; the end-to-end check is test_handshake_stdout_is_pure.
     """
     src = Path(mcp_server.__file__).read_text(encoding="utf-8")
     # The only modules it should import from rec are read-side ones.
-    forbidden = ["recorder", "transcriber", "audio_check", "web"]
+    forbidden = ["recorder", "transcriber", "audio_check", "web", "summarize", "providers"]
     for bad in forbidden:
         assert f"from . import {bad}" not in src, f"mcp_server imports {bad} (not read-only)"
         assert f"import {bad}" not in src, f"mcp_server imports {bad} (not read-only)"
@@ -503,7 +557,7 @@ def test_handshake_stdout_is_pure_jsonrpc(xdg, sessions):
                 assert init.server_info.name == "call-copilot"
                 tools = await s.list_tools()
                 names = sorted(t.name for t in tools.tools)
-                assert names == ["get_session", "list_sessions", "search_transcripts"]
+                assert names == ["get_session", "get_summary", "list_sessions", "search_transcripts"]
                 # Drive a real search to exercise the read path end to end.
                 res = await s.call_tool("search_transcripts", {"query": "client pricing"})
                 assert res.is_error is False

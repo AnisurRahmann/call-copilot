@@ -65,8 +65,11 @@ where = ["src"]
 # Ship the single-file browser UI in the wheel + sdist. Without this, `rec web`
 # installs fine and 404s on `/` — the Homebrew formula builds from the sdist,
 # so the static file must be declared here, not relied on by "it works locally".
+# The prompts/*.md templates are the same: a missing template on a clean
+# install is a shipping bug, so they're declared as package data too.
 [tool.setuptools.package-data]
 "rec.web" = ["static/*.html"]
+"rec.prompts" = ["*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
