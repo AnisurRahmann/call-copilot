@@ -329,3 +329,35 @@ def test_db_uses_wal_journal_mode(two_sessions):
     mode = con.execute("PRAGMA journal_mode").fetchone()[0]
     con.close()
     assert mode.lower() == "wal"
+
+
+# ---- stats() --------------------------------------------------------------
+
+
+def test_stats_reports_counts_after_indexing(two_sessions):
+    """stats() returns line/session counts for an indexed store."""
+    index.ensure_indexed()
+    st = index.stats()
+    assert st.sessions == 2          # the two_sessions fixture
+    assert st.lines > 0              # several transcript lines
+    assert st.last_indexed_at is not None
+    assert st.orphans == 0
+
+
+def test_stats_detects_orphans(two_sessions):
+    """A deleted session dir shows as an orphan (read-only, no prune)."""
+    index.ensure_indexed()
+    import shutil
+    shutil.rmtree(session.session_dir("2026-07-29_09-00-00"))
+    st = index.stats()
+    assert st.orphans == 1
+    # sessions count unchanged — stats does not prune.
+    assert st.sessions == 2
+
+
+def test_stats_on_empty_store_is_zero(xdg):
+    st = index.stats()
+    assert st.lines == 0
+    assert st.sessions == 0
+    assert st.last_indexed_at is None
+    assert st.orphans == 0

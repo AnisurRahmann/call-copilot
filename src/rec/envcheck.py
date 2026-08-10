@@ -59,6 +59,50 @@ def _audiotap_usable() -> bool:
         return False
 
 
+def mic_permission() -> str:
+    """Microphone permission state: ``"granted"``/``"denied"``/``"unknown"``.
+
+    Non-prompting (queries status, never triggers the OS dialog). Wraps the
+    audiotap probe the recorder already uses, so the Overview and `rec start`
+    agree. ``"unknown"`` is the safe answer off-macOS or if audiotap is absent.
+    """
+    try:
+        import audiotap
+
+        status = audiotap.mic_permission_status()
+        if status == audiotap.Permission.GRANTED:
+            return "granted"
+        if status == audiotap.Permission.DENIED:
+            return "denied"
+        return "unknown"  # UNKNOWN — may prompt at tap time
+    except Exception:
+        return "unknown"
+
+
+def screen_capture_status() -> str:
+    """Screen Recording permission: ``"granted"``/``"denied"``/``"unknown"``.
+
+    The hard one: there's no audiotap binding for screen capture, and TCC
+    attributes the permission to the responsible process (the terminal), so
+    this is best-effort. Uses the non-prompting CoreGraphics preflight
+    (``CGPreflightScreenCaptureAccess``) via ctypes; returns ``"unknown"``
+    off-macOS or if the symbol won't load — never a wrong "denied". Callers
+    treat the result as advisory (the recorder's silence check is ground truth).
+    """
+    if platform.system() != "Darwin":
+        return "unknown"
+    try:
+        import ctypes
+
+        cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        # Available macOS 10.15+. Returns bool without popping System Settings.
+        preflight = cg.CGPreflightScreenCaptureAccess
+        preflight.restype = ctypes.c_bool
+        return "granted" if preflight() else "denied"
+    except Exception:
+        return "unknown"
+
+
 def check_runtime() -> None:
     """Abort with an actionable message if this environment can't record.
 

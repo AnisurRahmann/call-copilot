@@ -47,6 +47,13 @@ log = get_logger(__name__)
 
 STOP_TIMEOUT_S = 5.0  # grace period after SIGTERM before forcing abort
 
+# The canonical capture modes offered to users (the API and the web select
+# render this list; the CLI --help references it). _parse_capture still
+# accepts the aliases (both, system+mic, "mic and system") for ergonomics,
+# but these three are the canonical names. Single source so the frontend
+# never hardcodes a set that can drift from what the recorder accepts.
+CAPTURE_MODES: tuple[str, ...] = ("mic+system", "mic", "system")
+
 
 # ---- daemonization (called from `rec start`) ------------------------------
 

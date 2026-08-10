@@ -148,3 +148,62 @@ def test_is_valid_session_id():
     assert not session.is_valid_session_id("../etc/passwd")
     assert not session.is_valid_session_id("")
     assert not session.is_valid_session_id("2026-8-10_1-42-47")  # not zero-padded
+
+
+# ---- capture_health -------------------------------------------------------
+
+
+def _meta(**kw):
+    """Build a SessionMeta with defaults for capture_health tests."""
+    base = dict(id="2026-01-01_00-00-00", started_at="2026-01-01T00:00:00",
+                status=session.STATUS_TRANSCRIBED, duration=120.0, word_count=200)
+    base.update(kw)
+    return session.SessionMeta(**base)
+
+
+def test_capture_health_silent_status():
+    assert session.capture_health(_meta(status=session.STATUS_SILENT, duration=60, word_count=0)) == "silent"
+
+
+def test_capture_health_unknown_when_duration_or_words_missing():
+    assert session.capture_health(_meta(duration=None, word_count=None)) == "unknown"
+    assert session.capture_health(_meta(duration=120, word_count=None)) == "unknown"
+    assert session.capture_health(_meta(duration=None, word_count=200)) == "unknown"
+
+
+def test_capture_health_suspect_low_wpm_over_long_duration():
+    # 10 words over 2 minutes = 5 wpm → suspect.
+    assert session.capture_health(_meta(duration=120, word_count=10)) == "suspect"
+
+
+def test_capture_health_ok_for_normal_speech():
+    # 200 words over 2 minutes = 100 wpm → ok.
+    assert session.capture_health(_meta(duration=120, word_count=200)) == "ok"
+
+
+def test_capture_health_short_sessions_not_flagged_suspect():
+    """The duration floor stops short test recordings from tripping."""
+    # 10 words over 10s = 60 wpm anyway, but more importantly duration < 30.
+    assert session.capture_health(_meta(duration=10, word_count=2)) == "ok"
+
+
+def test_capture_health_just_under_threshold_is_suspect():
+    # 19 wpm over 60s → suspect (< 20); just above floor duration.
+    assert session.capture_health(_meta(duration=60, word_count=19)) == "suspect"
+
+
+def test_audio_sources_infers_from_wavs(xdg):
+    sid = "2026-01-01_00-00-00"
+    session.update_meta(sid, status=session.STATUS_TRANSCRIBED)
+    session.create_session_dir(sid)
+    # Neither WAV → neither source.
+    assert session.audio_sources(sid) == (False, False)
+    session.wav_path(sid).write_bytes(b"sys")
+    assert session.audio_sources(sid) == (False, True)  # (has_mic, has_system)
+    session.mic_wav_path(sid).write_bytes(b"mic")
+    assert session.audio_sources(sid) == (True, True)
+
+
+def test_silent_diagnostic_hint_is_a_nonempty_string():
+    assert isinstance(session.SILENT_DIAGNOSTIC_HINT, str)
+    assert "Screen Recording" in session.SILENT_DIAGNOSTIC_HINT

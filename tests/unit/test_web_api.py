@@ -156,6 +156,8 @@ def test_sessions_list_has_audio_flags(web_server, xdg):
     row = payload["sessions"][0]
     assert row["has_mic"] is True
     assert row["has_system"] is True
+    # capture_health comes from the core function, not derived in JS.
+    assert row["capture_health"] in ("ok", "suspect", "silent", "unknown")
 
 
 def test_sessions_limit_query(web_server, xdg):
@@ -195,6 +197,10 @@ def test_session_detail_with_transcript(web_server, xdg):
     assert payload["transcript"] == text
     streams = {s["kind"] for s in payload["audio_streams"]}
     assert streams == {"mic", "system"}
+    # capture_health + the silent hint (served from the core constant, not
+    # duplicated in the frontend).
+    assert payload["capture_health"] in ("ok", "suspect", "silent", "unknown")
+    assert "Screen Recording" in payload["silent_hint"]
 
 
 def test_session_detail_without_transcript(web_server, xdg):
@@ -520,6 +526,17 @@ def test_get_config_returns_full_shape(web_server, xdg):
     assert "audiotap_usable" in payload
     # setup_hint is None when config exists.
     assert payload["setup_hint"] is None
+    # The layering-pass additions: capture modes from recorder, MCP wiring,
+    # index stats, permission probes, and a session-health tally.
+    assert payload["capture_modes"] == ["mic+system", "mic", "system"]
+    assert "mcp_wired" in payload
+    assert payload["index_stats"] is not None
+    assert "lines" in payload["index_stats"]
+    assert payload["mic_permission"] in ("granted", "denied", "unknown")
+    assert payload["screen_capture_status"] in ("granted", "denied", "unknown")
+    assert isinstance(payload["session_health"], dict)
+    for k in ("ok", "suspect", "silent", "unknown"):
+        assert k in payload["session_health"]
 
 
 def test_get_config_without_config_is_not_500(web_server, xdg):

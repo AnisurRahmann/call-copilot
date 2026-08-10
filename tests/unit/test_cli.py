@@ -648,6 +648,22 @@ def test_list_shows_sessions(monkeypatch, cfg_written, xdg):
     assert "2026-07-27 14:30" in res.output
     assert "transcribed" in res.output.lower()
     assert "4,231" in res.output
+    # The Health column header is present.
+    assert "Health" in res.output
+
+
+def test_list_shows_capture_health_column(monkeypatch, cfg_written, xdg):
+    """The health column flags suspect/silent sessions so a CLI user sees them."""
+    # A suspect session: long duration, very few words.
+    session.update_meta("2026-07-27_14-30-00", status=session.STATUS_TRANSCRIBED,
+                        duration=600.0, word_count=10, model="base")
+    # A silent session.
+    session.update_meta("2026-07-27_15-00-00", status=session.STATUS_SILENT,
+                        duration=120.0, word_count=0)
+    res = CliRunner().invoke(cli.cli, ["list"])
+    assert res.exit_code == 0, res.output
+    assert "suspect" in res.output
+    assert "silent" in res.output
 
 
 def test_list_empty(monkeypatch, cfg_written, xdg):
@@ -863,6 +879,55 @@ def test_index_bypasses_envcheck_gate(monkeypatch, xdg):
     res = CliRunner().invoke(cli.cli, ["index"])
     assert res.exit_code == 0, res.output
     assert "macOS" not in res.output  # gate did NOT fire
+
+
+def test_index_status_reports_counts_and_orphans(xdg):
+    """`rec index --status` shows lines/sessions and flags orphan rows."""
+    # Index one real session, then delete its dir to create an orphan.
+    sid = "2026-07-27_14-30-00"
+    session.create_session_dir(sid)
+    session.update_meta(sid, status=session.STATUS_TRANSCRIBED)
+    session.transcript_path(sid).write_text(
+        "# Meeting\n\n---\n\n[00:00] Hello world.\n", encoding="utf-8")
+    from rec import index as index_mod
+    index_mod.ensure_indexed(rebuild=True)
+    import shutil
+    shutil.rmtree(session.session_dir(sid))
+
+    res = CliRunner().invoke(cli.cli, ["index", "--status"])
+    assert res.exit_code == 0, res.output
+    assert "Orphans:" in res.output
+    assert "Sessions indexed:" in res.output
+
+
+def test_mcp_status_not_wired_when_no_entry(xdg, monkeypatch):
+    """mcp_status() reports not-wired when .claude.json has no entry."""
+    # xdg returns tmp_path; use it as HOME so the real file is never touched.
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/rec")
+    st = cli.mcp_status(home=xdg)
+    assert st["wired"] is False
+    assert "rec mcp install" in st["note"]
+
+
+def test_mcp_status_wired_when_entry_matches(xdg, monkeypatch):
+    """A matching mcpServers entry reads as wired."""
+    import json as _json
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/rec")
+    expected = {"type": "stdio", "command": "/usr/local/bin/rec", "args": ["mcp"]}
+    (xdg / ".claude.json").write_text(
+        _json.dumps({"mcpServers": {"call-copilot": expected}}))
+    st = cli.mcp_status(home=xdg)
+    assert st["wired"] is True
+
+
+def test_mcp_status_command_runs(xdg, monkeypatch):
+    """The `rec mcp status` CLI command exits 0 and prints a status line."""
+    monkeypatch.setattr(cli, "mcp_status",
+                        lambda **k: {"wired": False, "path": "/x/.claude.json",
+                                     "note": "test"})
+    res = CliRunner().invoke(cli.cli, ["mcp", "status"])
+    assert res.exit_code == 0, res.output
+    assert "not wired" in res.output.lower()
 
 
 def test_mcp_bypasses_envcheck_gate(monkeypatch, xdg):

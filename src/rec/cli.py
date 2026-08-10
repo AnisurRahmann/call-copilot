@@ -614,15 +614,26 @@ def list_(limit: int) -> None:
     table.add_column("Duration", justify="right", style="magenta")
     table.add_column("Words", justify="right")
     table.add_column("Status", justify="center")
+    table.add_column("Health", justify="center")
     table.add_column("Model", justify="center", style="dim")
 
     for m in sessions:
         words = "—" if m.word_count is None else f"{m.word_count:,}"
+        health = session.capture_health(m)
+        # suspect/silent carry weight (yellow) — a failed capture is the one
+        # thing a CLI user most needs to spot. ok is dim; unknown is muted.
+        if health in ("suspect", "silent"):
+            health_cell = f"[yellow]{health}[/]"
+        elif health == "ok":
+            health_cell = f"[dim]{health}[/]"
+        else:
+            health_cell = f"[dim]{health}[/]"
         table.add_row(
             session.started_at_display(m.id),
             session.format_duration_human(m.duration),
             words,
             m.status,
+            health_cell,
             m.model or "",
         )
 
@@ -985,6 +996,62 @@ def _mcp_install(scope: str) -> None:
     )
 
 
+def mcp_status(*, home: Path | None = None) -> dict:
+    """Whether the MCP server is wired into Claude Code.
+
+    Reads ``~/.claude.json`` (the file the fallback install path writes, and
+    where ``claude mcp add --scope user`` also lands) and checks the
+    ``mcpServers["call-copilot"]`` entry against the command ``rec mcp`` would
+    actually launch. Returns ``{wired: bool, path: str, note: str|None}``.
+
+    ``home`` is injectable for tests (defaults to the real ``Path.home()``).
+
+    Note: when the install went through the ``claude`` CLI with a non-user
+    scope, Claude manages its own config and this read may not see it — the
+    ``note`` field says so rather than reporting a false negative.
+    """
+    home = home if home is not None else Path.home()
+    claude_json = home / ".claude.json"
+    expected_cmd = _resolve_rec_command()
+    expected = {"type": "stdio", "command": expected_cmd[0]}
+    if len(expected_cmd) > 1:
+        expected["args"] = expected_cmd[1:]
+
+    if not claude_json.exists():
+        return {"wired": False, "path": str(claude_json),
+                "note": "Not installed. Run `rec mcp install`."}
+    try:
+        data = json.loads(claude_json.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"wired": False, "path": str(claude_json),
+                "note": f"{claude_json} is unreadable or not valid JSON."}
+    servers = data.get("mcpServers", {}) if isinstance(data, dict) else {}
+    entry = servers.get("call-copilot")
+    if entry is None:
+        return {"wired": False, "path": str(claude_json),
+                "note": "Not found in mcpServers. Run `rec mcp install`."}
+    # Allow entry with/without args; compare command + args.
+    if entry.get("command") == expected["command"] and entry.get("args") == expected.get("args"):
+        return {"wired": True, "path": str(claude_json),
+                "note": "Installed via ~/.claude.json (or `claude mcp add --scope user`)."}
+    return {"wired": True, "path": str(claude_json),
+            "note": "Wired, but the command differs from what `rec mcp` launches now "
+                    "(may be stale from a different install). Run `rec mcp install` to refresh."}
+
+
+@mcp.command(name="status")
+def mcp_status_cmd() -> None:
+    """Show whether the MCP server is wired into Claude Code."""
+    st = mcp_status()
+    click.echo(f"Config: {st['path']}")
+    if st["wired"]:
+        click.secho("Status: wired", fg="green")
+    else:
+        click.secho("Status: not wired", fg="yellow")
+    if st["note"]:
+        click.echo(st["note"])
+
+
 # ---- index (forced reindex of the FTS5 search cache) -----------------------
 
 
@@ -994,7 +1061,13 @@ def _mcp_install(scope: str) -> None:
     is_flag=True,
     help="Drop the search index and rebuild it from every transcript on disk.",
 )
-def index(rebuild: bool) -> None:
+@click.option(
+    "--status",
+    "show_status",
+    is_flag=True,
+    help="Show index health (lines, sessions, last indexed, orphans) and exit.",
+)
+def index(rebuild: bool, show_status: bool) -> None:
     """Build or refresh the transcript search index (FTS5).
 
     Search (`rec mcp`'s search_transcripts tool) indexes lazily on first use; this
@@ -1003,6 +1076,24 @@ def index(rebuild: bool) -> None:
     ~/.local/share/rec/index.db and can be safely deleted at any time.
     """
     from . import index as index_mod
+
+    if show_status:
+        st = index_mod.stats()
+        click.echo(f"Sessions indexed: {st.sessions}")
+        click.echo(f"Lines indexed:    {st.lines}")
+        if st.last_indexed_at is not None:
+            when = datetime.fromtimestamp(st.last_indexed_at).strftime("%Y-%m-%d %H:%M")
+            click.echo(f"Last indexed:     {when}")
+        else:
+            click.echo("Last indexed:     —")
+        orphans = st.orphans
+        if orphans:
+            click.secho(f"Orphans:          {orphans} indexed session(s) no longer on disk",
+                        fg="yellow")
+        else:
+            click.echo("Orphans:          0")
+        click.echo(f"Index:            {index_mod.index_path()}")
+        return
 
     n = index_mod.ensure_indexed(rebuild=rebuild)
     if rebuild:

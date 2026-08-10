@@ -439,6 +439,56 @@ def _build_context_from_db(con: sqlite3.Connection, session_id: str, line_no: in
     return " | ".join(r[1] for r in rows) if rows else ""
 
 
+# ---- stats (read-only health probe) ---------------------------------------
+
+
+@dataclass
+class IndexStats:
+    """A read-only snapshot of index health for `rec index --status` / Overview."""
+
+    lines: int            # transcript lines indexed (rows in transcript_fts)
+    sessions: int         # distinct sessions indexed (rows in `sessions`)
+    last_indexed_at: float | None  # unix ts of the most recent indexed_at, None if empty
+    orphans: int          # indexed sessions whose dir no longer exists on disk
+
+
+def stats() -> IndexStats:
+    """A read-only health snapshot: counts + orphans. Never mutates the index.
+
+    Orphans (an indexed session whose directory was deleted) mean search can
+    cite sessions that no longer exist — the worst failure mode for a citation
+    tool, so this is the number the Overview most wants to surface. Computed as
+    the set difference between indexed ids and on-disk ids (read-only; does
+    NOT call _prune, which would delete them).
+    """
+    try:
+        con = _connect(index_path())
+    except sqlite3.DatabaseError:
+        # A corrupt/unreadable db reports as empty; ensure_indexed self-heals
+        # on the next search, so this is a safe fallback rather than a crash.
+        return IndexStats(0, 0, None, 0)
+    try:
+        lines = con.execute("SELECT COUNT(*) FROM transcript_fts").fetchone()[0]
+        row = con.execute(
+            "SELECT COUNT(*), MAX(indexed_at) FROM sessions"
+        ).fetchone()
+        sessions, last_indexed_at = int(row[0]), row[1]
+        known = {r[0] for r in con.execute("SELECT session_id FROM sessions")}
+    except sqlite3.DatabaseError:
+        return IndexStats(0, 0, None, 0)
+    finally:
+        con.close()
+
+    live = _on_disk_session_ids()
+    orphans = len(known - live)
+    return IndexStats(
+        lines=int(lines),
+        sessions=sessions,
+        last_indexed_at=last_indexed_at,
+        orphans=orphans,
+    )
+
+
 def search(
     query: str,
     limit: int = 10,

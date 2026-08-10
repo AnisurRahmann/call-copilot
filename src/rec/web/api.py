@@ -55,6 +55,7 @@ def register(routes: dict[tuple[str, str], tuple]) -> None:
 def _meta_to_summary(meta: session.SessionMeta) -> dict:
     """One row of the session list: the fields the table renders."""
     sid = meta.id
+    has_mic, has_system = session.audio_sources(sid)
     return {
         "id": sid,
         "started_at": meta.started_at,
@@ -63,8 +64,9 @@ def _meta_to_summary(meta: session.SessionMeta) -> dict:
         "duration_human": session.format_duration_human(meta.duration),
         "word_count": meta.word_count,
         "model": meta.model,
-        "has_mic": session.mic_wav_path(sid).exists(),
-        "has_system": session.wav_path(sid).exists(),
+        "has_mic": has_mic,
+        "has_system": has_system,
+        "capture_health": session.capture_health(meta),
     }
 
 
@@ -212,12 +214,17 @@ def get_session_detail(h: WebHandler, id: str) -> None:
             "id": meta.id,
             "started_at": meta.started_at,
             "status": meta.status,
+            "capture_health": session.capture_health(meta),
             "duration": meta.duration,
             "duration_human": session.format_duration_human(meta.duration),
             "word_count": meta.word_count,
             "model": meta.model,
             "transcript": transcript,
             "audio_streams": _audio_streams(id),
+            # The silent-session hint, served from the one core constant so it
+            # can't drift between the CLI and the UI. The frontend renders this
+            # for a silent/low-wpm session instead of hardcoding the text.
+            "silent_hint": session.SILENT_DIAGNOSTIC_HINT,
         },
     )
 
@@ -452,6 +459,9 @@ def get_config(h: WebHandler) -> None:
         "sessions_root": _collapse_home(str(config.sessions_root())),
         "index_db": _collapse_home(str(index.index_path())),
         "setup_hint": setup_hint,
+        # The valid capture-mode set comes from the recorder (single source);
+        # the frontend select renders this list rather than hardcoding it.
+        "capture_modes": list(recorder.CAPTURE_MODES),
     }
 
     # Environment probes. Reuse envcheck's non-raising helpers; the names are
@@ -467,6 +477,44 @@ def get_config(h: WebHandler) -> None:
         payload["audiotap_usable"] = envcheck._audiotap_usable()
     except Exception:
         payload["audiotap_usable"] = None
+    # Permission probes (public, non-raising). Mic is a real audiotap API;
+    # screen capture is the best-effort ctypes preflight.
+    payload["mic_permission"] = envcheck.mic_permission()
+    payload["screen_capture_status"] = envcheck.screen_capture_status()
+
+    # Agent connection: is the MCP server wired into Claude Code? Delegates to
+    # the core helper (reads ~/.claude.json), so the Overview and `rec mcp
+    # status` agree.
+    try:
+        from .. import cli as cli_mod
+        mcp = cli_mod.mcp_status()
+        payload["mcp_wired"] = mcp["wired"]
+        payload["mcp_note"] = mcp["note"]
+    except Exception:
+        payload["mcp_wired"] = None
+        payload["mcp_note"] = None
+
+    # Index health: lines/sessions/orphans. Computed in index.py (the rule's
+    # single source); the Overview renders what it receives.
+    try:
+        st = index.stats()
+        payload["index_stats"] = {
+            "lines": st.lines, "sessions": st.sessions,
+            "orphans": st.orphans,
+            "last_indexed_at": st.last_indexed_at,
+        }
+    except Exception:
+        payload["index_stats"] = None
+
+    # Session-health summary: counts by capture_health across all sessions.
+    # The threshold lives in session.capture_health (core); this just tallies.
+    try:
+        from collections import Counter
+        counts = Counter(session.capture_health(m) for m in session.list_sessions())
+        payload["session_health"] = {k: counts.get(k, 0) for k in
+                                     ("ok", "suspect", "silent", "unknown")}
+    except Exception:
+        payload["session_health"] = None
 
     h._send_json(HTTPStatus.OK, payload)
 
@@ -474,9 +522,6 @@ def get_config(h: WebHandler) -> None:
 # ---- POST /api/recording/start --------------------------------------------
 # These mutating endpoints import jobs lazily so the read-only server never
 # carries the worker pool at import time.
-
-
-_VALID_CAPTURES = {"system", "mic", "mic+system"}
 
 
 def post_start(h: WebHandler) -> None:
@@ -498,10 +543,12 @@ def post_start(h: WebHandler) -> None:
         ) from None
     body = h._read_json()
     capture = (body.get("capture") or cfg.capture).strip().lower()
-    if capture not in _VALID_CAPTURES:
+    # The valid set comes from recorder.CAPTURE_MODES (single source of truth),
+    # not a hardcoded copy in the API layer.
+    if capture not in recorder.CAPTURE_MODES:
         raise _ApiError(
             HTTPStatus.BAD_REQUEST,
-            f"capture must be one of: {', '.join(sorted(_VALID_CAPTURES))}.",
+            f"capture must be one of: {', '.join(recorder.CAPTURE_MODES)}.",
         )
 
     from datetime import datetime

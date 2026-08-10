@@ -114,6 +114,17 @@ def transcript_path(session_id: str) -> Path:
     return session_dir(session_id) / TRANSCRIPT_FILENAME
 
 
+def audio_sources(session_id: str) -> tuple[bool, bool]:
+    """Which audio sources a session captured, inferred from which WAVs exist.
+
+    Returns ``(has_mic, has_system)``. Source is inferred from disk rather than
+    stored in session.json — that's the existing decision (no explicit source
+    field is written), so callers that need it derive it here. Centralised so
+    the CLI and the web API don't each reimplement the ``.exists()`` check.
+    """
+    return mic_wav_path(session_id).exists(), wav_path(session_id).exists()
+
+
 def create_session_dir(session_id: str) -> Path:
     d = session_dir(session_id)
     d.mkdir(parents=True, exist_ok=True)
@@ -175,6 +186,47 @@ def update_meta(session_id: str, **changes) -> SessionMeta:
     log.info("session meta updated: %s %s", session_id,
              ", ".join(f"{k}={v}" for k, v in changes.items()))
     return meta
+
+
+# The diagnostic shown to the user when a session captured only zero samples.
+# One string, defined once here, served to both the CLI (`rec stop`, `rec list`)
+# and the web UI — so the wording can't drift between surfaces.
+SILENT_DIAGNOSTIC_HINT = (
+    "No audio was captured. This usually means the Screen Recording permission "
+    "wasn't granted, or nothing was playing. The WAV is kept for `rec diagnose`."
+)
+
+# A suspect session: enough duration that real speech should have produced many
+# more words. <20 wpm over >30s is well below any real conversation (130–150
+# wpm) and above Whisper-on-silence hallucination density (single digits over
+# minutes). The duration floor stops short test recordings from tripping it.
+SUSPECT_WPM = 20.0
+SUSPECT_MIN_DURATION_S = 30.0
+
+
+def capture_health(meta: SessionMeta) -> str:
+    """How usable a session's capture looks: ``ok``/``suspect``/``silent``/``unknown``.
+
+    Pure function over ``SessionMeta`` (not a session id) so it's testable
+    without touching disk. The rule lives here — the single source — so the
+    CLI (`rec list`) and the web API flag the same sessions.
+
+    - ``silent``  — the recorder already marked it silent (``STATUS_SILENT``).
+    - ``unknown`` — duration or word_count isn't set yet (still recording, or
+      pre-transcription); must NOT be flagged as a failure.
+    - ``suspect`` — duration > 30s and words-per-minute < ``SUSPECT_WPM``: a
+      likely failed capture (silent tap, revoked permission, no audio playing).
+    - ``ok``      — otherwise.
+    """
+    if meta.status == STATUS_SILENT:
+        return "silent"
+    if meta.duration is None or meta.word_count is None:
+        return "unknown"
+    if meta.duration > SUSPECT_MIN_DURATION_S:
+        wpm = meta.word_count / (meta.duration / 60.0)
+        if wpm < SUSPECT_WPM:
+            return "suspect"
+    return "ok"
 
 
 def list_sessions() -> list[SessionMeta]:
