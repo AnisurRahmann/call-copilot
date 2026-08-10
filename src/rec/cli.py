@@ -1142,8 +1142,17 @@ def _transcribe_session(
         return _transcribe_session_inner(
             session_id, model_name, sys_wav, mic_wav, has_sys, has_mic, vad_filter
         )
-    except Exception:
-        session.update_meta(session_id, status=session.STATUS_RECORDED)
+    except BaseException:
+        # Includes KeyboardInterrupt and SystemExit, which ``except Exception``
+        # misses — a Ctrl+C during transcription used to skip this rollback,
+        # leaving session.json stuck at STATUS_TRANSCRIBING (which then poisons
+        # ``rec status`` via _transcribing_session). Roll back, then re-raise so
+        # exit semantics are unchanged. The inner guard ensures a failed rollback
+        # never masks the original abort.
+        try:
+            session.update_meta(session_id, status=session.STATUS_RECORDED)
+        except BaseException:
+            pass
         raise
 
 
