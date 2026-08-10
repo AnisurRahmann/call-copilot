@@ -5,20 +5,22 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Call Copilot</title>
 <style>
-  /* ===================================================================
-     tokens — single source of truth. No literal hex or magic px outside
-     this block. Palette derived from audio-metering vernacular; the accent
-     (--signal) is reserved for LIVE capture only, everything else is
-     greyscale + type weight.
-     =================================================================== */
+  /* =======================================================================
+     tokens — single source. Palette derived from audio-metering vernacular
+     (a PPM meter's nominal-level LED, tape/console equipment), not terminal
+     convention. The accent (--signal) is reserved for EXACTLY two states:
+     live capture and an active transcribe job. Everything else is greyscale
+     + type weight. Three-tier elevation where the old page had flat black.
+     ======================================================================= */
   :root {
-    --ink:    #0e1116;
-    --paper:  #161b22;
-    --rule:   #2a3038;
-    --text:   #c9d1d9;
-    --mute:   #6e7681;
-    --signal: #3fb950;
-    --amber:  #d29922;
+    --ink:     #0d1014;   /* page ground (cool near-black) */
+    --surface: #14181e;   /* header / sidebar */
+    --paper:   #1a2028;   /* rows, hover, panels — the missing elevation tier */
+    --rule:    #2a3038;   /* hairline rules */
+    --text:    #c9d1d9;   /* primary text */
+    --mute:    #6e7681;   /* secondary text */
+    --signal:  #4ade80;   /* accent — PPM nominal-level LED; live capture only */
+    --amber:   #d29922;   /* reserved: silent-session + failure diagnostics */
 
     --shell-w: 152px;
     --rack:    1100px;
@@ -26,13 +28,17 @@
     --pad-sm: 14px;
     --gap:    12px;
 
-    --fs-body: 14px;
-    --fs-sm:   13px;
-    --fs-xs:   12px;
-    --fs-xxs:  11px;
+    --fs-lg:  16px;
+    --fs-body:14px;
+    --fs-sm:  13px;
+    --fs-xs:  12px;
+    --fs-xxs: 11px;
 
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    /* transcript body reads as a notebook, not a terminal — a quiet serif on
+       paper, deliberately not a second mono and not a generic sans. */
+    --serif: ui-serif, "New York", Georgia, "Times New Roman", serif;
   }
 
   *, *::before, *::after { box-sizing: border-box; }
@@ -41,16 +47,14 @@
   a { color: var(--text); }
   code { font-family: var(--mono); }
 
-  /* ===================================================================
-     shell — the persistent chrome. Capture bar pinned across the top;
-     sidebar nav fixed on the left; main region holds the routed view.
-     =================================================================== */
+  /* =======================================================================
+     shell
+     ======================================================================= */
   .shell { display: flex; min-height: 100vh; }
 
-  /* ---- capture bar (always mounted, global recording state) --------- */
   .capturebar {
     position: fixed; top: 0; left: 0; right: 0; z-index: 20;
-    background: var(--ink);
+    background: var(--surface);   /* elevation tier 1 */
     border-bottom: 1px solid var(--rule);
   }
   .capturebar .row {
@@ -63,11 +67,8 @@
     color: var(--text); text-decoration: none; margin-right: 8px;
     display: inline-flex; align-items: baseline; gap: 6px;
   }
-  .brand .dot {
-    color: var(--mute);              /* idle: dimmed hollow mark */
-    font-size: var(--fs-xs);
-  }
-  .brand.live .dot { color: var(--signal); }   /* recording/transcribing only */
+  .brand .dot { color: var(--mute); font-size: var(--fs-xs); }      /* idle: dim hollow */
+  .brand.live .dot { color: var(--signal); }                        /* recording/transcribing */
   .state {
     font-family: var(--mono); font-size: var(--fs-xs); color: var(--mute);
     text-transform: lowercase; letter-spacing: 0.04em;
@@ -77,7 +78,6 @@
   .capturebar .spacer { flex: 1 1 auto; }
   #controls { display: flex; gap: var(--gap); align-items: center; }
 
-  /* the signature element: live capture strip */
   .capture-strip {
     height: 3px; width: 100%; background: var(--rule);
     position: relative; overflow: hidden;
@@ -87,14 +87,12 @@
     background: var(--signal); transition: width 0.25s linear;
   }
   .capture-strip.idle { display: none; }
-  @media (prefers-reduced-motion: reduce) {
-    .capture-strip .fill { transition: none; }
-  }
+  @media (prefers-reduced-motion: reduce) { .capture-strip .fill { transition: none; } }
 
-  /* ---- sidebar nav (extension point) -------------------------------- */
   .nav {
     position: fixed; top: 49px; bottom: 0; left: 0; width: var(--shell-w);
-    background: var(--ink); border-right: 1px solid var(--rule);
+    background: var(--surface);
+    border-right: 1px solid var(--rule);
     display: flex; flex-direction: column; padding: var(--pad) 0;
   }
   .nav a {
@@ -107,15 +105,11 @@
   .nav a[aria-current="page"] { color: var(--text); border-left: 2px solid var(--text); padding-left: calc(var(--pad) - 2px); }
   .nav .foot { margin-top: auto; padding: 0 var(--pad); font-family: var(--mono); font-size: var(--fs-xxs); color: var(--mute); }
 
-  /* ---- main region (routed views render here) ----------------------- */
   main {
-    margin-left: var(--shell-w);
-    margin-top: 49px;            /* clear the fixed capture bar */
-    padding: var(--pad) var(--pad) 80px;
-    max-width: var(--rack);
+    margin-left: var(--shell-w); margin-top: 49px;
+    padding: var(--pad) var(--pad) 80px; max-width: var(--rack);
   }
 
-  /* ---- responsive: nav collapses to a row below 700px -------------- */
   @media (max-width: 700px) {
     .nav {
       position: static; width: auto; flex-direction: row;
@@ -130,9 +124,9 @@
     .capturebar .row { padding: 10px var(--pad-sm); }
   }
 
-  /* ===================================================================
-     controls — buttons/selects. Instrument-panel look: no radius.
-     =================================================================== */
+  /* =======================================================================
+     controls
+     ======================================================================= */
   button, select {
     font-family: var(--mono); font-size: var(--fs-xs);
     background: var(--paper); color: var(--text);
@@ -153,11 +147,12 @@
   }
   input[type="search"]::placeholder { color: var(--mute); }
 
-  /* ===================================================================
-     tables — dense, hairline-ruled. No cards, no shadows.
-     =================================================================== */
+  /* =======================================================================
+     tables — dense, hairline-ruled
+     ======================================================================= */
   table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
   thead th {
+    position: sticky; top: 49px; z-index: 5; background: var(--surface);
     text-align: left; font-family: var(--mono); font-weight: 500;
     color: var(--mute); font-size: var(--fs-xxs); text-transform: uppercase;
     letter-spacing: 0.06em; padding: 6px 10px; border-bottom: 1px solid var(--rule);
@@ -168,60 +163,81 @@
   td.mono, th.mono { font-family: var(--mono); }
   td.mute, .mute { color: var(--mute); }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .day-head {
+    font-family: var(--mono); font-size: var(--fs-xxs); color: var(--mute);
+    text-transform: uppercase; letter-spacing: 0.08em;
+    padding: 14px 10px 6px; background: var(--ink);
+  }
 
-  /* status weight: transcribed (boring success) recedes; recorded/silent
-     carry more prominence. Typographic, not colour chips. */
+  /* status weight: transcribed (success) recedes; recorded/silent/suspect
+     carry prominence. Typographic, not colour chips. */
   .status-tag { font-family: var(--mono); font-size: var(--fs-xxs); text-transform: lowercase; color: var(--mute); }
   .status-tag[data-status="recorded"]  { color: var(--text); font-weight: 500; }
   .status-tag[data-status="silent"]    { color: var(--amber); font-weight: 500; }
+  .status-tag[data-status="suspect"]   { color: var(--amber); font-weight: 500; }
   .status-tag[data-status="recording"],
   .status-tag[data-status="transcribing"] { color: var(--signal); }
-  .status-tag .low { color: var(--mute); margin-left: 6px; font-size: var(--fs-xxs); }
 
-  /* ===================================================================
-     views — shared primitives each view may use.
-     =================================================================== */
+  /* =======================================================================
+     views — shared primitives
+     ======================================================================= */
   .empty {
     padding: 48px var(--pad-sm); text-align: center; color: var(--mute);
     font-family: var(--mono); font-size: var(--fs-sm);
   }
   .empty strong { color: var(--text); display: block; margin-bottom: 6px; font-weight: 600; }
-
   .back { font-family: var(--mono); font-size: var(--fs-xs); color: var(--mute); text-decoration: none; }
   .back:hover { color: var(--text); }
-
   .hint {
     border-left: 2px solid var(--amber); padding: 10px 14px;
     color: var(--text); font-size: var(--fs-sm); margin: 16px 0; background: var(--paper);
   }
 
+  /* overview */
+  .overview { max-width: 720px; }
+  .ov-block { margin-bottom: 32px; }
+  .ov-block > h2 {
+    font-family: var(--mono); font-size: var(--fs-xxs); color: var(--mute);
+    text-transform: uppercase; letter-spacing: 0.08em; font-weight: 500;
+    margin: 0 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--rule);
+  }
+  .ov-row { display: flex; gap: var(--gap); padding: 5px 0; font-size: var(--fs-sm); align-items: baseline; }
+  .ov-row .label { color: var(--mute); font-family: var(--mono); flex: 0 0 160px; }
+  .ov-row .value { color: var(--text); }
+  .ov-row .value.good { color: var(--signal); }
+  .ov-row .value.bad  { color: var(--amber); }
+  .ov-row .value a { color: var(--text); text-decoration: underline; text-decoration-color: var(--rule); text-underline-offset: 3px; }
+
   /* sessions: list */
   .toolbar { display: flex; gap: var(--gap); align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
   .toolbar input[type="search"] { flex: 1 1 280px; min-width: 0; }
-
-  /* sessions: search hits */
   .hit { padding: 12px 10px; border-bottom: 1px solid var(--rule); cursor: pointer; }
   .hit:hover { background: var(--paper); }
   .hit .ctx { font-family: var(--mono); font-size: var(--fs-xxs); color: var(--mute); margin-bottom: 3px; }
   .hit .line { color: var(--text); }
 
-  /* sessions: detail */
+  /* sessions: detail (two-column at wide widths) */
+  .detail-wrap { display: grid; grid-template-columns: 1fr; gap: var(--pad); }
+  @media (min-width: 900px) { .detail-wrap { grid-template-columns: 320px 1fr; align-items: start; } }
+  .detail-side { position: sticky; top: 60px; }
   .detail-meta { font-family: var(--mono); font-size: var(--fs-xs); color: var(--mute); margin: 8px 0 20px; }
   .detail-meta strong { color: var(--text); font-weight: 500; }
-  .streams { display: flex; flex-direction: column; gap: 10px; margin-bottom: 28px; }
+  .streams { display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px; }
   .stream { display: flex; align-items: center; gap: var(--gap); }
   .stream label { font-family: var(--mono); font-size: var(--fs-xxs); color: var(--mute); width: 52px; text-transform: uppercase; letter-spacing: 0.05em; }
-  audio { flex: 1; height: 34px; }
+  audio { flex: 1; height: 34px; min-width: 0; }
   .transcript-actions { display: flex; gap: var(--gap); align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
-  .transcript { font-family: var(--sans); font-size: 15px; line-height: 1.65; max-width: 760px; }
+  .transcript { font-family: var(--serif); font-size: 15px; line-height: 1.7; }
   .transcript h1, .transcript h2, .transcript h3 { font-family: var(--mono); font-size: var(--fs-body); color: var(--text); margin: 1.4em 0 0.5em; }
   .transcript p { margin: 0 0 0.9em; }
-  .transcript .ts-line { display: flex; gap: 14px; margin: 0 0 0.6em; }
-  .transcript .ts-line time { font-family: var(--mono); color: var(--mute); flex: 0 0 auto; min-width: 56px; }
-  .transcript .ts-line .speaker { color: var(--mute); font-family: var(--mono); font-size: var(--fs-xs); }
+  .transcript .ts-line { display: flex; gap: 14px; margin: 0 0 0.55em; }
+  .transcript .ts-line time { font-family: var(--mono); color: var(--mute); flex: 0 0 auto; min-width: 52px; font-size: var(--fs-xs); opacity: 0.7; }
+  .transcript .ts-line .speaker { color: var(--mute); font-family: var(--mono); font-size: var(--fs-xs); flex: 0 0 56px; }
+  .transcript .ts-line.mic .words { padding-left: 0; }
+  .transcript .ts-line.system .words { padding-left: 0; }
   .transcript .ts-line .words { flex: 1; }
 
-  /* settings: definition table */
+  /* settings */
   .def th { width: 1%; white-space: nowrap; color: var(--mute); font-weight: 400; }
   .def td { font-family: var(--mono); }
   .def td.bool-yes { color: var(--signal); }
@@ -230,10 +246,9 @@
 </head>
 <body>
 
-<!-- ===== capture bar (global, never unmounts) ===== -->
 <div class="capturebar">
   <div class="row">
-    <a class="brand" href="#/sessions"><span class="dot">●</span> rec</a>
+    <a class="brand" href="#/"><span class="dot">●</span> rec</a>
     <span id="state" class="state" aria-live="polite">not recording</span>
     <span class="spacer"></span>
     <div id="controls"></div>
@@ -244,19 +259,14 @@
 </div>
 
 <div class="shell">
-  <!-- ===== sidebar nav (extension point) ===== -->
   <nav class="nav" id="nav" aria-label="views"></nav>
-
-  <!-- ===== routed views render here ===== -->
   <main id="view"></main>
 </div>
 
 <script>
 "use strict";
 
-/* =======================================================================
-   helpers
-   ======================================================================= */
+/* ---- helpers ---- */
 const $ = (sel, root = document) => root.querySelector(sel);
 const viewEl = () => $("#view");
 const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) =>
@@ -274,8 +284,6 @@ const fmtClock = (s) => {
                  : `${m}:${String(r).padStart(2,"0")}`;
 };
 async function api(path, opts) {
-  // Every POST carries X-Requested-With — the CSRF guard (custom header
-  // forces a CORS preflight this server doesn't grant).
   if (opts && opts.method === "POST") {
     opts = Object.assign({}, opts, { headers: Object.assign({ "X-Requested-With": "rec-web" }, opts.headers || {}) });
   }
@@ -287,12 +295,8 @@ async function api(path, opts) {
 }
 function errHtml(e) { return `<div class="empty"><strong>${escapeHtml(e.message)}</strong>Try again in a moment.</div>`; }
 
-/* =======================================================================
-   capture bar — polls /api/status on its own interval. Always mounted.
-   ======================================================================= */
-const capture = {
-  timer: null, ms: 5000, prevBytes: null, prevTime: null,
-};
+/* ---- capture bar (global, never unmounts) ---- */
+const capture = { timer: null, ms: 5000, prevBytes: null, prevTime: null };
 
 async function refreshStatus() {
   let st; try { st = await api("/api/status"); }
@@ -307,7 +311,7 @@ async function refreshStatus() {
       `<span class="meta">${fmtBytes(st.bytes)}</span>`, true);
     showStrip(rate); renderControls({ recording: true }); brand.classList.add("live");
     capture.ms = 1000;
-  } else if (st.session_id) {  // transcribing
+  } else if (st.session_id) {
     setState(`transcribing <span class="meta">${escapeHtml(st.session_id)}</span>`, true);
     hideStrip(); renderControls({ recording: false }); brand.classList.add("live");
     capture.ms = 1000;
@@ -342,9 +346,15 @@ function renderControls({ recording }) {
     c.innerHTML = `<button id="stopBtn" class="primary">Stop recording</button>`;
     $("#stopBtn").onclick = onStop;
   } else {
-    c.innerHTML = `<select id="captureSel" aria-label="capture mode">
-        <option value="mic+system">mic + system</option><option value="mic">mic</option><option value="system">system</option>
-      </select><button id="startBtn" class="primary">Start recording</button>`;
+    // The capture-mode options come from /api/config (recorder.CAPTURE_MODES);
+    // the select is rebuilt once config loads so we never hardcode the set.
+    c.innerHTML = `<select id="captureSel" aria-label="capture mode"></select><button id="startBtn" class="primary">Start recording</button>`;
+    api("/api/config").then(cfg => {
+      const sel = $("#captureSel");
+      if (!sel) return;
+      const modes = cfg.capture_modes || ["mic+system","mic","system"];
+      sel.innerHTML = modes.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("");
+    }).catch(() => {});
     $("#startBtn").onclick = onStart;
   }
 }
@@ -367,33 +377,25 @@ async function pollJob(jobId, sessionId, doneCb) {
   } catch { setTimeout(() => pollJob(jobId, sessionId, doneCb), 2000); }
 }
 
-/* =======================================================================
-   router + view registry
-   Adding a view = one entry here + one mount() + one route below.
-   The shell owns every setInterval; views declare poll and the shell
-   drives/clears it so navigation never leaks timers.
-   ======================================================================= */
-const VIEWS = {};  // populated below by each view: { label, mount, unmount, poll }
-
-const router = {
-  current: null,      // name of the mounted view
-  pollTimer: null,
-};
+/* ---- router + view registry ----
+   Adding a view = one entry + one mount fn + one route. The shell owns every
+   setInterval; views declare poll and the shell starts/clears it on unmount. */
+const VIEWS = {};
+const router = { current: null, pollTimer: null };
 
 function parseHash() {
-  let h = location.hash || "#/sessions";
-  if (h === "#" || h === "#/") h = "#/sessions";
-  // #/sessions, #/sessions/<id>, #/settings — otherwise redirect.
-  if (h.startsWith("#/sessions") || h.startsWith("#/settings")) return h.slice(1);  // leading '/'
-  return "/sessions";
+  let h = location.hash || "#/";
+  if (h === "#" ) h = "#/";
+  if (h === "#/") return "/overview";
+  if (h.startsWith("#/sessions") || h.startsWith("#/settings") || h.startsWith("#/overview")) return h.slice(1);
+  return "/overview";   // unknown → Overview (the new default)
 }
 function route() {
   const path = parseHash();
-  // mark the active nav link
+  const seg = path.split("/")[1] || "overview";
   $("#nav").querySelectorAll("a").forEach(a => {
-    a.setAttribute("aria-current", a.getAttribute("data-route") === path.split("/")[1] ? "page" : null);
+    a.setAttribute("aria-current", a.getAttribute("data-route") === seg ? "page" : null);
   });
-  // unmount the previous view (clears its timers/listeners)
   if (router.current && VIEWS[router.current] && VIEWS[router.current].unmount) VIEWS[router.current].unmount();
   if (router.pollTimer) { clearInterval(router.pollTimer); router.pollTimer = null; }
 
@@ -401,10 +403,10 @@ function route() {
   if (path.startsWith("/sessions/")) { name = "sessions"; params = { id: decodeURIComponent(path.slice("/sessions/".length)) }; }
   else if (path.startsWith("/sessions")) { name = "sessions"; params = {}; }
   else if (path.startsWith("/settings")) { name = "settings"; params = {}; }
-  else { name = "sessions"; params = {}; }
+  else { name = "overview"; params = {}; }
 
   router.current = name;
-  viewEl().innerHTML = "";  // hand the view a clean container
+  viewEl().innerHTML = "";
   const v = VIEWS[name];
   v.mount(viewEl(), params);
   if (v.poll) router.pollTimer = setInterval(() => v.mount(viewEl(), params, true), v.poll);
@@ -412,14 +414,78 @@ function route() {
 function go(hash) { if (location.hash !== hash) location.hash = hash; else route(); }
 window.addEventListener("hashchange", route);
 
-/* =======================================================================
-   sessions view — list, search, detail. Ported unchanged in appearance;
-   adds session-health (wpm) marking and status weight.
-   ======================================================================= */
+/* ---- Overview view ---- */
+const overviewView = {
+  label: "Overview", poll: 10000,
+  mount(container) {
+    container.innerHTML = `<div class="overview"><div class="empty">Checking system…</div></div>`;
+    api("/api/config").then(cfg => renderOverview(container, cfg)).catch(e => { container.innerHTML = errHtml(e); });
+  },
+  unmount() {},
+};
+VIEWS.overview = overviewView;
+
+function renderOverview(container, cfg) {
+  const c = cfg.config;
+  const boolVal = (v, yesWord="yes", noWord="no") =>
+    v === true || v === "granted" ? `<span class="value good">${yesWord}</span>`
+    : (v === false || v === "denied") ? `<span class="value bad">${noWord}</span>`
+    : `<span class="value">${v == null ? "unknown" : v}</span>`;
+  const macosOk = cfg.macos_supported === true;
+  const audiotapOk = cfg.audiotap_usable === true;
+  const micOk = cfg.mic_permission === "granted";
+  // Screen capture is advisory — 'unknown' is honest, not a failure.
+  const screen = cfg.screen_capture_status;
+  const screenLine = screen === "granted" ? boolVal(true, "granted", "denied")
+    : screen === "denied" ? `<span class="value bad">denied — toggle it on for your terminal in System Settings, then quit + reopen the terminal</span>`
+    : `<span class="value">unknown — run <code>rec setup</code> to test</span>`;
+
+  // MCP wiring
+  const mcpWired = cfg.mcp_wired === true;
+  const mcpLine = mcpWired
+    ? `<span class="value good">wired</span>`
+    : `<span class="value bad">not wired — run <code>rec mcp install</code></span>`;
+
+  // Session health
+  const sh = cfg.session_health || { ok:0, suspect:0, silent:0, unknown:0 };
+  const healthLine = (count, label, filter) =>
+    count > 0 ? `<a href="#/sessions${filter}">${count} ${label}</a>` : `<span class="mute">${count} ${label}</span>`;
+  const suspectSilent = (sh.suspect || 0) + (sh.silent || 0);
+
+  // Index health
+  const ix = cfg.index_stats || { lines: 0, sessions: 0, orphans: 0 };
+  const indexLine = ix.orphans > 0
+    ? `<span class="value bad">${ix.lines.toLocaleString()} lines · ${ix.sessions} sessions · ${ix.orphans} orphan(s) — run <code>rec index</code> to clean</span>`
+    : `<span class="value">${ix.lines.toLocaleString()} lines · ${ix.sessions} sessions · 0 orphans</span>`;
+
+  container.innerHTML = `<div class="overview">
+    <div class="ov-block">
+      <h2>Capture readiness</h2>
+      <div class="ov-row"><span class="label">macOS</span>${boolVal(macosOk, cfg.macos_version + " — supported", cfg.macos_version + " — needs 14.2+")}</div>
+      <div class="ov-row"><span class="label">audiotap</span>${boolVal(audiotapOk, "loads", "missing")}</div>
+      <div class="ov-row"><span class="label">microphone</span>${boolVal(micOk, "granted", "denied")}</div>
+      <div class="ov-row"><span class="label">screen recording</span>${screenLine}</div>
+    </div>
+    <div class="ov-block">
+      <h2>Agent connection</h2>
+      <div class="ov-row"><span class="label">MCP server</span>${mcpLine}</div>
+    </div>
+    <div class="ov-block">
+      <h2>Session health</h2>
+      <div class="ov-row"><span class="label">${(sh.ok||0) + (sh.suspect||0) + (sh.silent||0) + (sh.unknown||0)} total</span>
+        <span class="value">${healthLine(sh.ok||0, "ok", "")} &nbsp; ${healthLine(sh.suspect||0, "suspect", "")} &nbsp; ${healthLine(sh.silent||0, "silent", "")} &nbsp; ${healthLine(sh.unknown||0, "unknown", "")}</span>
+      </div>
+    </div>
+    <div class="ov-block">
+      <h2>Index health</h2>
+      <div class="ov-row"><span class="label">search index</span>${indexLine}</div>
+    </div>
+  </div>`;
+}
+
+/* ---- Sessions view ---- */
 const sessionsView = {
-  timer: null, qTimer: null,
-  label: "Sessions",
-  poll: null,
+  timer: null, qTimer: null, label: "Sessions", poll: null,
   mount(container, params, isPoll) {
     if (params.id) return sessionsDetail(container, params.id);
     sessionsList(container, isPoll);
@@ -427,15 +493,6 @@ const sessionsView = {
   unmount() { if (this.qTimer) clearTimeout(this.qTimer); },
 };
 VIEWS.sessions = sessionsView;
-
-// ---- session-health rule: flag low wpm as a likely failed capture ----
-// duration > 30s AND word_count known AND words_per_minute < 20.
-function isLowQuality(s) {
-  if (s.duration == null || s.word_count == null) return false;
-  if (s.duration <= 30) return false;
-  const wpm = s.word_count / (s.duration / 60);
-  return wpm < 20;
-}
 
 function sessionsList(container, isPoll) {
   if (!isPoll) {
@@ -454,22 +511,58 @@ async function loadList(body) {
   try {
     const { sessions } = await api("/api/sessions?limit=100");
     if (!sessions.length) { body.innerHTML = `<div class="empty"><strong>No sessions yet.</strong>Press Start recording in the header to capture a meeting.</div>`; return; }
-    body.innerHTML = `<table><thead><tr><th>started</th><th>dur</th><th class="col-words">words</th><th>status</th><th class="col-words">model</th></tr></thead><tbody>${sessions.map(rowHtml).join("")}</tbody></table>`;
+    body.innerHTML = renderGrouped(sessions);
     body.querySelectorAll("tbody tr").forEach(tr => {
       tr.onclick = () => go(`#/sessions/${tr.dataset.id}`);
       tr.onkeydown = (e) => { if (e.key === "Enter") go(`#/sessions/${tr.dataset.id}`); };
     });
   } catch (e) { body.innerHTML = errHtml(e); }
 }
+
+function renderGrouped(sessions) {
+  // Group by day (Today / Yesterday / date), newest first. sessions is already
+  // newest-first from the API.
+  const groups = [];
+  let last = null;
+  const today = new Date(); today.setHours(0,0,0,0);
+  const yest = new Date(today); yest.setDate(yest.getDate()-1);
+  for (const s of sessions) {
+    const d = s.started_at ? new Date(s.started_at) : null;
+    let label;
+    if (d) {
+      const day = new Date(d); day.setHours(0,0,0,0);
+      if (day.getTime() === today.getTime()) label = "Today";
+      else if (day.getTime() === yest.getTime()) label = "Yesterday";
+      else label = day.toLocaleDateString(undefined, { year:"numeric", month:"short", day:"numeric" });
+    } else { label = "Undated"; }
+    if (label !== last) { groups.push({ label, rows: [] }); last = label; }
+    groups[groups.length-1].rows.push(s);
+  }
+  let out = "";
+  for (const g of groups) {
+    out += `<div class="day-head">${escapeHtml(g.label)}</div>`;
+    out += `<table><thead><tr><th>started</th><th>dur</th><th class="num">words</th><th>status</th><th>model</th></tr></thead><tbody>`;
+    out += g.rows.map(rowHtml).join("");
+    out += `</tbody></table>`;
+  }
+  return out;
+}
+
 function rowHtml(s) {
-  const started = s.started_at ? s.started_at.replace("T"," ").slice(5) : "—";
-  const low = isLowQuality(s) ? `<span class="low">low</span>` : "";
+  // started_at time only within a day group.
+  const t = s.started_at ? s.started_at.replace("T"," ").slice(11,16) : "—";
+  const dur = s.duration_human || "—";
+  const durClass = (s.duration != null && s.duration > 600) ? "" : "mute";  // long → heavier
+  const words = s.word_count != null ? s.word_count.toLocaleString() : "—";
+  // capture_health drives the status tag so failed captures are scannable.
+  const health = s.capture_health || "unknown";
+  const statusData = health === "silent" ? "silent" : health === "suspect" ? "suspect" : s.status;
   return `<tr data-id="${escapeHtml(s.id)}" tabindex="0">
-    <td class="mono">${escapeHtml(started)}</td>
-    <td class="mono mute">${escapeHtml(s.duration_human || "—")}</td>
-    <td class="mono num col-words">${s.word_count != null ? s.word_count.toLocaleString() : "—"}</td>
-    <td><span class="status-tag" data-status="${escapeHtml(s.status)}">${escapeHtml(s.status)}${low}</span></td>
-    <td class="mono mute col-words">${escapeHtml(s.model || "—")}</td></tr>`;
+    <td class="mono">${escapeHtml(t)}</td>
+    <td class="mono ${durClass}">${escapeHtml(dur)}</td>
+    <td class="mono num">${words}</td>
+    <td><span class="status-tag" data-status="${escapeHtml(statusData)}">${escapeHtml(s.status)}${health === "suspect" || health === "silent" ? ` <span class="mute">· ${escapeHtml(health)}</span>` : ""}</span></td>
+    <td class="mono mute">${escapeHtml(s.model || "—")}</td></tr>`;
 }
 async function runSearch(body, q) {
   body.innerHTML = `<div class="empty">Searching…</div>`;
@@ -492,18 +585,23 @@ async function sessionsDetail(container, id) {
   try {
     const s = await api("/api/sessions/" + encodeURIComponent(id));
     const streams = (s.audio_streams || []).map(streamHtml).join("");
-    const meta = `<div class="detail-meta"><strong>${escapeHtml(s.id)}</strong> · ${escapeHtml(s.status)} · ${escapeHtml(s.duration_human || "—")} · ${s.word_count != null ? s.word_count.toLocaleString() + " words" : ""}${s.model ? ` · ${escapeHtml(s.model)}` : ""}</div>`;
+    const meta = `<div class="detail-meta"><strong>${escapeHtml(s.id)}</strong> · ${escapeHtml(s.status)}${s.capture_health && s.capture_health !== "ok" ? ` · ${escapeHtml(s.capture_health)}` : ""} · ${escapeHtml(s.duration_human || "—")} · ${s.word_count != null ? s.word_count.toLocaleString() + " words" : ""}${s.model ? ` · ${escapeHtml(s.model)}` : ""}</div>`;
     let body;
-    if (s.status === "silent") {
-      body = `<div class="hint">No audio was captured. This usually means the Screen Recording permission wasn't granted, or nothing was playing. The WAV is kept for <code>rec diagnose</code>.</div>`;
+    if (s.status === "silent" || s.capture_health === "silent") {
+      // The hint comes from the core constant (s.silent_hint) — never hardcoded here.
+      body = `<div class="hint">${escapeHtml(s.silent_hint || "")}</div>`;
     } else if (s.transcript == null) {
       body = `<div class="empty"><strong>No transcript yet.</strong>${transcribeBtnHtml(s)}</div>`;
     } else {
       let healthNote = "";
-      if (isLowQuality(s)) healthNote = `<div class="hint">Few words for the duration — the capture may have failed. Check the audio levels or Screen Recording permission.</div>`;
-      body = `${healthNote}${streams ? `<div class="streams">${streams}</div>` : ""}<div class="transcript-actions"><button onclick="navigator.clipboard.writeText(document.getElementById('tx').innerText)">Copy</button><a href="data:text/markdown;charset=utf-8,${encodeURIComponent(s.transcript)}" download="transcript.md"><button>Download .md</button></a>${transcribeBtnHtml(s)}</div><div class="transcript" id="tx">${renderMarkdown(s.transcript)}</div>`;
+      if (s.capture_health === "suspect") healthNote = `<div class="hint">Few words for the duration — the capture may have failed. Check the audio levels or Screen Recording permission.</div>`;
+      body = `${healthNote}<div class="detail-wrap">
+        <div class="detail-side">${streams ? `<div class="streams">${streams}</div>` : ""}${meta}<div class="transcript-actions"><button onclick="navigator.clipboard.writeText(document.getElementById('tx').innerText)">Copy</button><a href="data:text/markdown;charset=utf-8,${encodeURIComponent(s.transcript)}" download="transcript.md"><button>Download .md</button></a>${transcribeBtnHtml(s)}</div></div>
+        <div class="transcript" id="tx">${renderMarkdown(s.transcript)}</div>
+      </div>`;
     }
-    container.innerHTML = `<p><a href="#/sessions" class="back">← all sessions</a></p>${meta}${body}`;
+    container.innerHTML = `<p><a href="#/sessions" class="back">← all sessions</a></p>${body || ""}`;
+    if (!body) container.insertAdjacentHTML("beforeend", meta);
   } catch (e) { container.innerHTML = `<p><a href="#/sessions" class="back">← all sessions</a></p>` + errHtml(e); }
 }
 function streamHtml(st) { return `<div class="stream"><label>${escapeHtml(st.kind)}</label><audio controls preload="metadata" src="${escapeHtml(st.url)}"></audio></div>`; }
@@ -526,18 +624,18 @@ function renderMarkdown(md) {
     if (/^#{1,3}\s/.test(line)) { flush(); const n = line.match(/^#+/)[0].length; out += `<h${n}>${escapeHtml(line.replace(/^#+\s*/,""))}</h${n}>`; continue; }
     if (/^[-*]\s/.test(line)) { flush(); out += `<p class="mute">${escapeHtml(line)}</p>`; continue; }
     const m = line.match(tsRe);
-    if (m) { flush(); const sp = m[2] ? `<span class="speaker">[${escapeHtml(m[2])}]</span>` : ""; out += `<div class="ts-line"><time>${escapeHtml(m[1])}</time>${sp}<span class="words">${escapeHtml(m[3])}</span></div>`; }
-    else inPara.push(line);
+    if (m) {
+      flush();
+      const spk = m[2] ? `<span class="speaker">${escapeHtml(m[2])}</span>` : `<span class="speaker"></span>`;
+      out += `<div class="ts-line ${(m[2]||"").toLowerCase()}"><time>${escapeHtml(m[1])}</time>${spk}<span class="words">${escapeHtml(m[3])}</span></div>`;
+    } else inPara.push(line);
   }
   flush(); return out;
 }
 
-/* =======================================================================
-   settings view — read-only definition table from /api/config.
-   ======================================================================= */
+/* ---- Settings view ---- */
 const settingsView = {
-  label: "Settings",
-  poll: null,
+  label: "Settings", poll: null,
   mount(container) {
     container.innerHTML = `<div class="empty">Loading…</div>`;
     api("/api/config").then(cfg => renderSettings(container, cfg)).catch(e => { container.innerHTML = errHtml(e); });
@@ -556,6 +654,8 @@ function renderSettings(container, cfg) {
       <tr><th>version</th><td>${escapeHtml(cfg.version)}</td></tr>
       <tr><th>macOS</th><td>${escapeHtml(cfg.macos_version)} ${cfg.macos_supported === false ? '<span style="color:var(--amber)">(needs 14.2+)</span>' : ""}</td></tr>
       <tr><th>audiotap</th>${boolCell(cfg.audiotap_usable)}</tr>
+      <tr><th>microphone</th><td>${escapeHtml(cfg.mic_permission || "unknown")}</td></tr>
+      <tr><th>screen recording</th><td>${escapeHtml(cfg.screen_capture_status || "unknown")}</td></tr>
       <tr><th>config present</th>${boolCell(cfg.config_present)}</tr>
     </tbody></table>
     <h2 style="font-family:var(--mono);font-size:var(--fs-sm);color:var(--mute);text-transform:uppercase;letter-spacing:.06em;margin:24px 0 12px;">Capture &amp; transcription</h2>
@@ -574,27 +674,17 @@ function renderSettings(container, cfg) {
     ${note}`;
 }
 
-/* =======================================================================
-   boot
-   ======================================================================= */
-// Build the nav from the registry — the extension point. Each entry is one
-// view; adding a future view (diagnostics, summaries) is one VIEWS entry.
+/* ---- boot ---- */
 function buildNav() {
-  const nav = $("#nav");
-  nav.innerHTML = "";
+  const nav = $("#nav"); nav.innerHTML = "";
   for (const [name, v] of Object.entries(VIEWS)) {
     const a = document.createElement("a");
-    a.href = "#/" + name; a.textContent = v.label;
-    a.setAttribute("data-route", name);
+    a.href = "#/" + name; a.textContent = v.label; a.setAttribute("data-route", name);
     nav.appendChild(a);
   }
-  const foot = document.createElement("div");
-  foot.className = "foot";
-  nav.appendChild(foot);
-  // version comes from /api/config (cheap, cached after first poll)
+  const foot = document.createElement("div"); foot.className = "foot"; nav.appendChild(foot);
   api("/api/config").then(c => { foot.textContent = "v" + c.version; }).catch(() => {});
 }
-
 document.addEventListener("click", (e) => {
   if (e.target && e.target.id === "retxBtn") {
     const id = (location.hash || "").replace(/^#\/sessions\//, "");
