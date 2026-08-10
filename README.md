@@ -200,6 +200,10 @@ meter, a seekable audio player beside its transcript, or a session list you can
 skim in one glance — the browser can, so the UI exists for exactly those three
 things.
 
+![rec web — session list](docs/web-sessions.png)
+
+![rec web — session detail with audio and transcript](docs/web-detail.png)
+
 ```bash
 rec setup            # one-time, in a terminal (the UI can't grant capture permission)
 rec web              # opens a browser tab at http://127.0.0.1:7717
