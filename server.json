@@ -2,19 +2,19 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.anisurrahmann/call-copilot",
   "title": "Call Copilot",
-  "description": "Read-only access to locally-recorded meeting transcripts. Search and read meetings that were recorded with `rec` over stdio. Never starts, stops, or deletes a recording, and makes no network calls — everything stays on your machine.",
+  "description": "Search and read locally-recorded meeting transcripts over stdio. Read-only, no network.",
   "websiteUrl": "https://github.com/AnisurRahmann/call-copilot",
   "repository": {
     "url": "https://github.com/AnisurRahmann/call-copilot",
     "source": "github"
   },
-  "version": "0.4.1",
+  "version": "0.4.2",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "call-copilot",
-      "version": "0.4.1",
+      "version": "0.4.2",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

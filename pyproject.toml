@@ -1,6 +1,6 @@
 [project]
 name = "call-copilot"
-version = "0.4.1"
+version = "0.4.2"
 description = "Call Copilot — silently record meeting audio in the background, then transcribe locally to clean markdown."
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
