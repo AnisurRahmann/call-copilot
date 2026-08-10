@@ -40,12 +40,15 @@ class GeminiProvider:
                 "maxOutputTokens": max_tokens,
             },
         }
-        url = (
-            f"{self.base_url.rstrip('/')}/models/{model}:generateContent"
-            f"?key={self.api_key}"
-        )
+        url = f"{self.base_url.rstrip('/')}/models/{model}:generateContent"
         log.info("provider=%s model=%s requesting (max_tokens=%d)", self.name, model, max_tokens)
-        data = _http.post_json(url, payload=payload, headers={}, timeout=timeout)
+        # Auth via the x-goog-api-key header, NOT ?key= in the URL — a key in the
+        # URL could leak into logs/error output if the HTTP lib or logging changes.
+        data = _http.post_json(
+            url, payload=payload,
+            headers={"x-goog-api-key": self.api_key},
+            timeout=timeout,
+        )
 
         text = _extract_content(data)
         tokens_in, tokens_out = _extract_usage(data, fallback_text=text)

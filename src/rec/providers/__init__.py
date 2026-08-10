@@ -100,11 +100,20 @@ def known_presets() -> list[str]:
 
 
 def is_local_base_url(base_url: str) -> bool:
-    """True if a base URL points at localhost — those never prompt for consent."""
+    """True if a base URL points at localhost — those never prompt for consent.
+
+    Parses the URL and checks the *actual* hostname, not a substring (a substring
+    check would let ``http://localhost.evil.com`` or ``http://127.0.0.1.nip.io``
+    skip the consent prompt and exfiltrate the transcript + key to an attacker).
+    """
     if not base_url:
         return False
-    lowered = base_url.lower()
-    return "localhost" in lowered or "127.0.0.1" in lowered
+    from urllib.parse import urlparse
+    try:
+        host = (urlparse(base_url).hostname or "").lower().strip("[]")
+    except ValueError:
+        return False
+    return host in ("localhost", "127.0.0.1", "::1")
 
 
 def is_local_provider(name: str, base_url: str | None) -> bool:
@@ -174,6 +183,17 @@ def make_provider(
     preset = _PRESETS.get(name)
     transport = preset["transport"] if preset else "openai-compat"
     eff_base_url = (base_url or (preset["default_base_url"] if preset else "")).strip()
+
+    # Reject non-http(s) base URLs. A file:// URL could be read by urllib, and
+    # the transcript/key should never reach anything but an http(s) endpoint.
+    if eff_base_url:
+        from urllib.parse import urlparse
+        scheme = (urlparse(eff_base_url).scheme or "").lower()
+        if scheme not in ("http", "https"):
+            raise NoProviderError(
+                f"Provider {name!r} base_url must be http(s), got {eff_base_url!r} "
+                f"(scheme {scheme!r})."
+            )
 
     api_key = _resolve_api_key(name=name, api_key_env=api_key_env, env=env)
 
