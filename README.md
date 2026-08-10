@@ -2,6 +2,8 @@
 
 > One thing. Done really well. Record meetings. Save transcripts. Don't break audio.
 
+<!-- mcp-name: io.github.anisurrahmann/call-copilot -->
+
 Call Copilot is a terminal command (`rec`) that records your meeting audio and, when you
 stop it, transcribes locally and saves a clean markdown transcript. **Everything runs on
 your machine** — no cloud, no API keys, no account. Audio and transcripts never leave the
@@ -189,6 +191,19 @@ into `.cursor/mcp.json`; for Zed, into `settings.json` under `mcp_servers`. It l
 
 You can also run the server directly with `rec mcp` (stdio transport) if a client prefers a
 raw command.
+
+### Official MCP Registry
+
+Call Copilot is listed on the [official MCP Registry](https://registry.modelcontextprotocol.io)
+under `io.github.anisurrahmann/call-copilot`. Any MCP client that speaks the registry can
+discover and add it from there. The registry entry runs the server with:
+
+```bash
+uvx --from call-copilot rec mcp
+```
+
+(The PyPI package is `call-copilot`; the command it installs is `rec`, so the server is
+launched as `rec mcp`.)
 
 ## Browser UI
 
