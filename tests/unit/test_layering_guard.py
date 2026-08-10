@@ -70,16 +70,35 @@ def test_mcp_server_imports_neither_recorder_nor_web() -> None:
 def test_web_does_not_import_cli_directly_at_module_top() -> None:
     """The web layer reaches cli lazily (inside functions), not at module import.
 
-    A top-level `from .. import cli` would create a heavy import cycle (cli
+    A top-level ``from .. import cli`` would create a heavy import cycle (cli
     pulls in recorder/transcriber/formatter). The endpoints that need cli
-    (jobs transcription) import it inside the function body."""
+    (jobs transcription) import it inside the function body.
+
+    Catches three top-level forms: ``from .. import cli`` (module is None, so
+    the alias must be inspected), ``from ..cli import x``, and ``import cli``
+    / ``import rec.cli``. Lazy imports inside function bodies are fine.
+    """
     for path in WEB_FILES:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        # Only top-level ImportFrom (level>=1, module == 'cli') is banned; lazy
-        # imports live inside function bodies and are fine.
         for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.ImportFrom) and node.module and "cli" in node.module:
-                pytest.fail(
-                    f"{path.relative_to(SRC)} imports cli at module top — do it "
-                    f"lazily inside the function that needs it."
-                )
+            if isinstance(node, ast.ImportFrom):
+                # `from .. import cli` (module is None) — inspect aliases.
+                if node.module is None:
+                    for alias in node.names:
+                        if alias.name == "cli":
+                            pytest.fail(
+                                f"{path.relative_to(SRC)} imports cli at module top "
+                                f"— do it lazily inside the function that needs it."
+                            )
+                elif "cli" in node.module:
+                    pytest.fail(
+                        f"{path.relative_to(SRC)} imports cli at module top — do it "
+                        f"lazily inside the function that needs it."
+                    )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.split(".")[0] == "cli" or alias.name == "rec.cli":
+                        pytest.fail(
+                            f"{path.relative_to(SRC)} imports cli at module top — do it "
+                            f"lazily inside the function that needs it."
+                        )

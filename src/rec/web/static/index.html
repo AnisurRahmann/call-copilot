@@ -401,7 +401,7 @@ function rowHtml(s) {
   return `<tr data-id="${escapeHtml(s.id)}">
     <td class="mono">${escapeHtml(started)}</td>
     <td class="mono mute">${escapeHtml(s.duration_human || "—")}</td>
-    <td class="mono num col-words">${s.word_count != null ? s.word_count.toLocaleString() : "—"}</td>
+    <td class="mono num col-words">${s.word_count != null ? escapeHtml(s.word_count.toLocaleString()) : "—"}</td>
     <td><span class="status-tag" data-status="${escapeHtml(s.status)}">${escapeHtml(s.status)}</span></td>
     <td class="mono mute col-words">${escapeHtml(s.model || "—")}</td>
   </tr>`;
@@ -443,7 +443,7 @@ async function showDetail(id) {
       <strong>${escapeHtml(s.id)}</strong>
       · ${escapeHtml(s.status)}
       · ${escapeHtml(s.duration_human || "—")}
-      · ${s.word_count != null ? s.word_count.toLocaleString() + " words" : ""}
+      · ${s.word_count != null ? escapeHtml(s.word_count.toLocaleString() + " words") : ""}
       ${s.model ? ` · ${escapeHtml(s.model)}` : ""}
     </div>`;
     let body;

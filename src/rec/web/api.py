@@ -20,11 +20,19 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 from .. import config, recorder, session
+from ..log import get_logger
 from .ranges import parse_range
 from .server import _ApiError
 
 if TYPE_CHECKING:
     from .server import WebHandler
+
+log = get_logger(__name__)
+
+# Chunk size for streaming audio from disk. 64 KiB is large enough to amortise
+# the per-read overhead and small enough that memory stays flat regardless of
+# file size or number of concurrent requests.
+_STREAM_CHUNK = 64 * 1024
 
 
 def register(routes: dict[tuple[str, str], tuple]) -> None:
@@ -114,12 +122,14 @@ def get_status(h: WebHandler) -> None:
     sid = None
     if recording:
         # The active session is the one in STATUS_RECORDING, else the newest.
-        for meta in session.list_sessions():
+        # One listing covers both checks (the loop falls back to metas[0]).
+        metas = session.list_sessions()
+        for meta in metas:
             if meta.status == session.STATUS_RECORDING:
                 sid = meta.id
                 break
-        if sid is None and session.list_sessions():
-            sid = session.list_sessions()[0].id
+        if sid is None and metas:
+            sid = metas[0].id
         payload["session_id"] = sid
         meta = session.load_meta(sid) if sid else None
         payload["started_at"] = meta.started_at if meta else None
@@ -129,7 +139,6 @@ def get_status(h: WebHandler) -> None:
     else:
         transcribing = _transcribing_session_id()
         payload["session_id"] = transcribing
-        payload["job"] = None  # populated in T6 from the job registry
         payload["started_at"] = None
         payload["elapsed_s"] = None
         payload["bytes"] = 0
@@ -205,8 +214,9 @@ def get_session_detail(h: WebHandler, id: str) -> None:
         try:
             transcript = tpath.read_text(encoding="utf-8")
         except OSError as e:
+            log.warning("could not read transcript %s (%r)", tpath, e)
             raise _ApiError(
-                HTTPStatus.INTERNAL_SERVER_ERROR, f"Could not read transcript: {e}."
+                HTTPStatus.INTERNAL_SERVER_ERROR, "Could not read the transcript."
             ) from e
     h._send_json(
         HTTPStatus.OK,
@@ -235,6 +245,26 @@ def get_session_detail(h: WebHandler, id: str) -> None:
 _AUDIO_KINDS = {"system", "mic"}
 
 
+def _stream_file_range(wfile, path, start: int, length: int) -> None:
+    """Stream ``length`` bytes from ``path`` starting at ``start`` in chunks.
+
+    Reads sequentially from disk so the working set stays bounded regardless of
+    file size — never buffers the whole file. A read short of the declared
+    ``length`` (file shrank mid-stream) is tolerated; the client simply gets a
+    truncated body, which an audio player handles gracefully.
+    """
+    remaining = length
+    with path.open("rb") as fh:
+        if start:
+            fh.seek(start)
+        while remaining > 0:
+            chunk = fh.read(min(_STREAM_CHUNK, remaining))
+            if not chunk:
+                break  # file shrank beneath us; serve what we have
+            wfile.write(chunk)
+            remaining -= len(chunk)
+
+
 def get_audio(h: WebHandler, id: str, stream: str) -> None:
     """Serve a session's WAV, Range-capable so Safari's <audio> plays and seeks.
 
@@ -254,34 +284,14 @@ def get_audio(h: WebHandler, id: str, stream: str) -> None:
         raise _ApiError(HTTPStatus.NOT_FOUND, f"No {stream} audio for session {id}.")
 
     try:
-        data = path.read_bytes()
+        total = path.stat().st_size
     except OSError as e:
+        log.warning("could not stat %s (%r)", path, e)
         raise _ApiError(
-            HTTPStatus.INTERNAL_SERVER_ERROR, f"Could not read audio: {e}."
+            HTTPStatus.INTERNAL_SERVER_ERROR, "Could not read the audio file."
         ) from e
 
-    total = len(data)
     spec = parse_range(h.headers.get("Range"), total)
-
-    if spec.kind == "none":
-        # Full body. Advertise range support so the client knows it can seek.
-        h._send_bytes(
-            HTTPStatus.OK,
-            data,
-            "audio/wav",
-            extra_headers=[("Accept-Ranges", "bytes")],
-        )
-        return
-
-    if spec.kind == "multi":
-        # Fall back to the full body rather than attempting multipart/byteranges.
-        h._send_bytes(
-            HTTPStatus.OK,
-            data,
-            "audio/wav",
-            extra_headers=[("Accept-Ranges", "bytes")],
-        )
-        return
 
     if spec.kind == "invalid":
         # Unsatisfiable. Per RFC 7233, include Content-Range: bytes */T.
@@ -292,17 +302,31 @@ def get_audio(h: WebHandler, id: str, stream: str) -> None:
         h.end_headers()
         return
 
-    # Single satisfiable range → 206 Partial Content.
-    chunk = data[spec.start : spec.end + 1]
-    h.send_response(HTTPStatus.PARTIAL_CONTENT)
+    # Stream directly from disk instead of buffering the whole WAV: a long
+    # meeting can be hundreds of MB, and Safari's <audio> issues many Range
+    # requests during playback/scrubbing — read_bytes() on each would let one
+    # client pin gigabytes of memory.
+    if spec.kind in ("none", "multi"):
+        # Full body (multi-range falls back to the whole file rather than
+        # attempting multipart/byteranges). Advertise range support so the
+        # client knows it can seek.
+        start, length = 0, total
+        status = HTTPStatus.OK
+    else:  # single satisfiable range → 206 Partial Content
+        start, length = spec.start, spec.end - spec.start + 1
+        status = HTTPStatus.PARTIAL_CONTENT
+
+    h.send_response(status)
     h.send_header("Content-Type", "audio/wav")
-    h.send_header("Content-Length", str(len(chunk)))
-    h.send_header("Content-Range", f"bytes {spec.start}-{spec.end}/{total}")
+    h.send_header("Content-Length", str(length))
     h.send_header("Accept-Ranges", "bytes")
+    if status == HTTPStatus.PARTIAL_CONTENT:
+        h.send_header("Content-Range", f"bytes {spec.start}-{spec.end}/{total}")
     h.send_header("X-Content-Type-Options", "nosniff")
     h.end_headers()
-    if h.command != "HEAD":
-        h.wfile.write(chunk)
+    if h.command == "HEAD":
+        return
+    _stream_file_range(h.wfile, path, start, length)
 
 
 # ---- GET /api/search ------------------------------------------------------
@@ -341,7 +365,7 @@ def get_search(h: WebHandler) -> None:
                 "count": 0,
                 "guidance": (
                     "Search is temporarily unavailable. Browse the session list "
-                    f"instead. (detail: {e})"
+                    "instead."
                 ),
             },
         )
@@ -564,8 +588,9 @@ def post_start(h: WebHandler) -> None:
     try:
         recorder.spawn_recorder(session_id, cfg.sample_rate, cfg.channels, capture)
     except Exception as e:
+        log.warning("spawn_recorder failed (%r)", e)
         raise _ApiError(
-            HTTPStatus.INTERNAL_SERVER_ERROR, f"Failed to start recording: {e}."
+            HTTPStatus.INTERNAL_SERVER_ERROR, "Failed to start recording."
         ) from e
     h._send_json(HTTPStatus.CREATED, {"session_id": session_id, "capture": capture})
 
@@ -580,6 +605,11 @@ def post_stop(h: WebHandler) -> None:
     ``409`` if not recording, or if a transcription job is already queued/running.
     """
     from . import jobs
+
+    # Always drain the body: with HTTP/1.1 keep-alive, leaving unread bytes in
+    # rfile corrupts the next request on the connection. Stop takes no params,
+    # but a client (or a CSRF probe) may still send a Content-Length.
+    h._read_json()
 
     if recorder.active_pid() is None:
         raise _ApiError(HTTPStatus.CONFLICT, "Not recording.")

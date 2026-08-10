@@ -118,7 +118,6 @@ def test_status_idle_when_not_recording(web_server, monkeypatch, xdg):
     assert status == 200
     assert payload["recording"] is False
     assert payload["session_id"] is None
-    assert payload["job"] is None
 
 
 def test_status_recording_reports_active_session(web_server, monkeypatch, xdg):
@@ -221,10 +220,45 @@ def test_session_detail_missing_is_404(web_server, xdg):
     assert payload["error"]
 
 
+def test_session_detail_transcript_read_error_leaks_no_path(web_server, xdg, tmp_path):
+    """A transcript that can't be read returns a generic message, not the FS path.
+
+    Guards the "no internal paths/tracebacks to the client" rule: OSError
+    messages include the full file path, which must not reach the browser.
+    """
+    sid = _make_session(status=session.STATUS_TRANSCRIBED, transcript=None)
+    # Make the transcript path unreadable by replacing it with a directory.
+    tpath = session.transcript_path(sid)
+    tpath.mkdir()
+    host, port = web_server
+    status, payload = _json(host, port, f"/api/sessions/{sid}")
+    assert status == 500
+    assert "Could not read the transcript." in payload["error"]
+    # No filesystem path or exception type leaks into the response body.
+    assert str(tpath) not in json.dumps(payload)
+    assert "IsADirectory" not in json.dumps(payload)
+    assert "NotADirectory" not in json.dumps(payload)
+
+
 def test_session_detail_bad_id_is_400(web_server, xdg):
     """A non-conformant id is rejected before touching session_dir (traversal)."""
     host, port = web_server
     status, payload = _json(host, port, "/api/sessions/..%2Fetc%2fpasswd")
+    assert status == 400
+    assert payload["error"]
+
+
+def test_session_detail_newline_in_id_is_400(web_server, xdg):
+    """A trailing newline must not slip past the id validator.
+
+    Python's ``$`` regex anchor matches before a trailing ``\\n``, so an id
+    like ``2026-01-01_00-00-00\\n`` would pass a ``^...$`` pattern. The router
+    must reject it (it's not a real session dir), and must never reach
+    session_dir.
+    """
+    host, port = web_server
+    # %0A is URL-encoded newline. A valid timestamp shape + newline suffix.
+    status, payload = _json(host, port, "/api/sessions/2026-01-01_00-00-00%0a")
     assert status == 400
     assert payload["error"]
 

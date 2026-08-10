@@ -148,6 +148,10 @@ def test_is_valid_session_id():
     assert not session.is_valid_session_id("../etc/passwd")
     assert not session.is_valid_session_id("")
     assert not session.is_valid_session_id("2026-8-10_1-42-47")  # not zero-padded
+    # A trailing newline must not pass: Python's `$` matches before a `\n`,
+    # so the validator uses fullmatch to anchor both ends strictly.
+    assert not session.is_valid_session_id("2026-08-10_01-42-47\n")
+    assert not session.is_valid_session_id("2026-08-10_01-42-47\r")
 
 
 # ---- capture_health -------------------------------------------------------

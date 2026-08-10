@@ -79,8 +79,13 @@ _SESSION_ID_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
 
 
 def is_valid_session_id(session_id: str) -> bool:
-    """True if ``session_id`` matches the canonical ``YYYY-MM-DD_HH-MM-SS`` shape."""
-    return bool(_SESSION_ID_PATTERN.match(session_id))
+    """True if ``session_id`` matches the canonical ``YYYY-MM-DD_HH-MM-SS`` shape.
+
+    Uses :func:`re.fullmatch` rather than ``$`` anchoring: ``$`` matches before
+    a trailing newline, so ``"2026-01-01_00-00-00\\n"`` would slip through a
+    ``^...$`` pattern even though it's not a valid (or safe) id.
+    """
+    return bool(_SESSION_ID_PATTERN.fullmatch(session_id))
 
 
 def new_session_id(now: datetime | None = None) -> str:
@@ -245,7 +250,7 @@ def list_sessions() -> list[SessionMeta]:
     for child in sorted(root.iterdir(), reverse=True):
         if not child.is_dir():
             continue
-        if not _SESSION_ID_PATTERN.match(child.name):
+        if not _SESSION_ID_PATTERN.fullmatch(child.name):
             continue
         meta = load_meta(child.name)
         if meta is not None:

@@ -68,6 +68,11 @@ class WebHandler(BaseHTTPRequestHandler):
     # connections alive; we always send a body or Content-Length: 0.
     protocol_version = "HTTP/1.1"
 
+    # Drop a connection that stalls mid-request so a client that opens a socket
+    # and sits on it can't hold a worker thread indefinitely. 30s is generous
+    # for a loopback client and longer than any legal request here takes.
+    timeout = 30
+
     # ---- request entry points --------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
@@ -192,21 +197,12 @@ class WebHandler(BaseHTTPRequestHandler):
 
     # ---- quiet, redacted access log -------------------------------------
 
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 (signature)
-        # Print method + path + status only. Never the query string (it may
-        # carry a search term), never a body. Keeps transcript text and queries
-        # out of the global DEBUG log.
-        try:
-            status = int(getattr(self, "_status_code", 0))
-        except (TypeError, ValueError):
-            status = 0
-        path_only = urllib.parse.urlsplit(self.path).path
-        log.info("%s %s %d", self.command, path_only, status)
-
-    # BaseHTTPRequestHandler sends a 200 line to stderr by default; override
-    # log_request so our quiet log_message is the only access record.
+    # BaseHTTPRequestHandler writes a default stderr access line; we override
+    # log_request to emit our own quiet one-liner instead — method, path (no
+    # query string), and the real status code passed in by send_response.
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:  # noqa: ARG002
-        self.log_message("%s %s %s", self.command, self.path, code)
+        path_only = urllib.parse.urlsplit(self.path).path
+        log.info("%s %s %s", self.command, path_only, code)
 
 
 class _ApiError(Exception):
@@ -226,7 +222,18 @@ def _get_index(h: WebHandler) -> None:
     html = _load_static("index.html")
     if html is None:
         raise _ApiError(HTTPStatus.NOT_FOUND, "Web UI is not installed in this build.")
-    h._send_bytes(HTTPStatus.OK, html, "text/html; charset=utf-8")
+    # Deny framing entirely: the page has Start/Stop recording controls, and a
+    # clickjacking overlay over them could trick a user into triggering capture.
+    # The Host guard stops DNS rebinding but not iframe embedding on 127.0.0.1.
+    h._send_bytes(
+        HTTPStatus.OK,
+        html,
+        "text/html; charset=utf-8",
+        extra_headers=[
+            ("X-Frame-Options", "DENY"),
+            ("Content-Security-Policy", "frame-ancestors 'none'"),
+        ],
+    )
 
 
 def _load_static(name: str) -> bytes | None:
@@ -323,12 +330,18 @@ def make_server(port: int, handler_cls: type[BaseHTTPRequestHandler] = WebHandle
     try:
         return _RecWebServer((LOOPBACK_HOST, port), handler_cls)
     except OSError as e:
-        # EADDRINUSE (48 on macOS, 98 on Linux) — the common case. Print one
-        # clean line naming the port and the override flag, never a traceback.
-        if e.errno in (errno.EADDRINUSE, getattr(errno, "EACCES", 13)):
+        # Distinguish the two common bind failures with one clean line each,
+        # never a traceback. EADDRINUSE (48 on macOS, 98 on Linux) is the usual
+        # one; EACCES (e.g. --port 80 without privileges) needs a different hint.
+        if e.errno == errno.EADDRINUSE:
             raise click.ClickException(
                 f"Port {port} is already in use. Try another with --port, "
                 f"or close the other process holding it."
+            ) from e
+        if e.errno == getattr(errno, "EACCES", 13):
+            raise click.ClickException(
+                f"Permission denied to bind port {port}. Ports below 1024 need "
+                f"privileges — try a higher port with --port."
             ) from e
         raise click.ClickException(f"Could not start the web server: {e}") from e
 
@@ -361,3 +374,22 @@ def serve(port: int = DEFAULT_PORT, *, open_browser: bool = True) -> None:
     finally:
         server.shutdown()
         server.server_close()
+        # Cancel queued transcription jobs and stop the worker pool so a Ctrl+C
+        # while a Whisper run is in flight doesn't hang the process on the
+        # non-daemon executor thread. An in-flight job still runs to completion
+        # (cooperative cancellation is a bigger change); tell the user why.
+        from . import jobs
+
+        if _has_active_job(jobs):
+            print("rec web: waiting for in-flight transcription to finish…")
+        jobs.registry.shutdown()
+
+
+def _has_active_job(jobs_mod) -> bool:
+    """True if the global registry has any queued or running job."""
+    registry = jobs_mod.registry
+    with registry._lock:  # noqa: SLF001 (introspect the singleton once at shutdown)
+        return any(
+            j.state in (jobs_mod.JobState.queued, jobs_mod.JobState.running)
+            for j in registry._jobs.values()  # noqa: SLF001
+        )
