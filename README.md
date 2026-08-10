@@ -355,10 +355,56 @@ Issues and pull requests are welcome at
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR, and report security
 issues privately per [SECURITY.md](SECURITY.md).
 
+## Summarisation (opt-in, BYOK)
+
+`rec` can turn a transcript into a `summary.md` using your own API key — but
+only if you configure a provider. With no provider set, nothing is ever sent
+anywhere and you'll never see a prompt.
+
+**Summarisation is opt-in and BYOK.** With no provider configured, `rec` never
+summarises, never prompts, and never makes a network call — the default install
+is transcript-only. Configure a key and `rec` will offer to summarise each
+recording when it finishes. The summary goes to `summary.md`; `transcript.md`
+stays a verbatim record and nothing is ever written into it.
+
+### GLM quickstart
+
+```bash
+export ZAI_API_KEY=...          # get one at https://z.ai
+```
+
+Add a `summarize` block to `~/.config/rec/config.json`:
+
+```json
+{
+  "summarize": {
+    "provider": "glm",
+    "api_key_env": "ZAI_API_KEY",
+    "tier1_model": "glm-4.7-flash",
+    "tier3_model": "glm-5"
+  }
+}
+```
+
+See what it will cost first (zero network calls):
+
+```bash
+rec summarize <id> --dry-run
+```
+
+Then run it for real:
+
+```bash
+rec summarize <id>
+```
+
+Ollama, Anthropic, Gemini, DeepSeek, and any OpenAI-compatible endpoint work
+through the same config block — point `provider` at the right preset. Ollama and
+any `localhost` base URL never trigger the one-time network consent prompt.
+
 ## What this is NOT
 
 - Not a real-time transcription tool (transcription happens after you stop).
-- Not a meeting summarizer (just the transcript).
 - Not a Zoom/Meet plugin (it captures system audio generically).
 - Not cross-platform (macOS 14.2+ only).
 

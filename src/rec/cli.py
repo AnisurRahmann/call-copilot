@@ -21,6 +21,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -37,6 +38,78 @@ from . import __version__, audio_check, config, envcheck, formatter, recorder, s
 from . import log as log_mod
 
 console = Console()
+
+
+# ---- interactive prompt seams (Step 3) ------------------------------------
+# These are the single points that touch stdin / TTY detection, isolated so
+# every prompt test monkeypatches them rather than faking a TTY. Under CliRunner
+# sys.stdin.isatty() is always False, which is why _is_interactive is a seam.
+
+DEFAULT_PROMPT_TIMEOUT_S = 60.0
+
+
+def _is_interactive() -> bool:
+    """True if stdin is a TTY (so a prompt won't block forever).
+
+    A seam (not sys.stdin.isatty() inline) so tests can flip it: CliRunner makes
+    isatty() always False, so without this the interactive path is untestable.
+    """
+    import sys
+    return bool(sys.stdin.isatty())
+
+
+def prompt_yes_no(question: str, *, default: bool, timeout_s: float) -> bool:
+    """Ask a yes/no question on stdin, returning ``default`` on Enter.
+
+    The single function that touches stdin. It owns the KeyboardInterrupt and
+    EOFError conversions internally — a Ctrl+C at the prompt is treated as the
+    default (NOT a crash), so "at the prompt → exit 0" is achievable. Every
+    prompt test monkeypatches this.
+
+    A timeout (no answer in ``timeout_s`` seconds) returns ``default`` too —
+    silence does not consent. The timeout is a seam (not a literal 60s) so tests
+    can set it to ~0.
+    """
+    import select
+    import sys
+    hint = "[Y/n]" if default else "[y/N]"
+    sys.stdout.write(f"{question} {hint}\n")
+    sys.stdout.flush()
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
+        if not ready:
+            return default  # timeout → treat as default (silence ≠ yes)
+        line = sys.stdin.readline().strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        # Ctrl+C / closed stdin at the prompt → default, not a crash.
+        return default
+    if line == "":
+        return default
+    return line in ("y", "yes")
+
+
+def _install_stop_handler() -> None:
+    """Install the first-SIGINT-stops-recording handler (Step 3).
+
+    First Ctrl+C sets a flag asking the recording loop to stop normally; the
+    handler then restores Python's default disposition so a SECOND Ctrl+C raises
+    KeyboardInterrupt (handled by the phase it lands in). Restore
+    ``default_int_handler`` (which raises), NOT ``SIG_DFL`` (which hard-kills
+    with no finally — reintroducing the Commit A wedge bug).
+    """
+    global _stop_requested
+    _stop_requested = False
+    signal.signal(signal.SIGINT, _stop_handler)
+
+
+def _stop_handler(signum, frame):  # pragma: no cover — signal delivery is manual-test
+    """First-SIGINT handler: set the stop flag, restore default disposition."""
+    global _stop_requested
+    _stop_requested = True
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+
+_stop_requested = False
 
 
 def _setup_logging_for_run(verbose: int, quiet: bool, command: str | None) -> None:
@@ -298,7 +371,15 @@ def _run_capture_selftest(cfg: config.RecConfig, duration: float) -> None:
     is_flag=True,
     help="Capture only the microphone (your voice), not system audio.",
 )
-def start(model: str | None, vad: bool, detach: bool, system_only: bool, mic_only: bool) -> None:
+@click.option(
+    "--summarize/--no-summarize",
+    "summarize_flag",
+    default=None,
+    help="After transcription, summarise (--summarize) or skip (--no-summarize). "
+         "Without a flag, the summarize.auto config governs (default: ask).",
+)
+def start(model: str | None, vad: bool, detach: bool, system_only: bool, mic_only: bool,
+          summarize_flag: bool | None) -> None:
     """Start recording. Shows a live indicator; press Ctrl+C to stop & transcribe."""
     if system_only and mic_only:
         raise click.ClickException("--system-only and --mic-only are mutually exclusive.")
@@ -346,7 +427,14 @@ def start(model: str | None, vad: bool, detach: bool, system_only: bool, mic_onl
     # Foreground mode: show a live recording indicator until Ctrl+C, then stop
     # + transcribe in the same command. This is the default UX — you see that
     # recording is in progress and can stop it without a second terminal.
-    _run_live_recording(cfg, session_id, model_override=model, vad_filter=vad)
+    flag = None
+    if summarize_flag is True:
+        flag = "yes"
+    elif summarize_flag is False:
+        flag = "no"
+    _run_live_recording(
+        cfg, session_id, model_override=model, vad_filter=vad, summarize_flag=flag,
+    )
 
 
 def _run_live_recording(
@@ -355,6 +443,7 @@ def _run_live_recording(
     *,
     model_override: str | None,
     vad_filter: bool,
+    summarize_flag: str | None = None,
 ) -> None:
     """Show a live ● REC indicator (elapsed + file size) until Ctrl+C, then finish."""
     from rich.live import Live
@@ -384,15 +473,26 @@ def _run_live_recording(
     try:
         # refresh_per_second=2 keeps elapsed/size fresh without burning CPU.
         # transient=True clears the indicator on exit so it doesn't clutter logs.
+        # Install the first-SIGINT-stops handler: the first Ctrl+C sets
+        # _stop_requested and restores the default disposition; the loop exits
+        # cleanly, then transcription/prompt run under the default disposition.
+        _install_stop_handler()
         with Live(render(), console=console, refresh_per_second=2, transient=True) as live:
             while recorder.active_pid() is not None:
                 live.update(render())
+                if _stop_requested:
+                    break
                 time.sleep(0.5)
+        # Always restore the default disposition before leaving the loop, so a
+        # Ctrl+C during transcription/prompt raises KeyboardInterrupt normally.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
     except KeyboardInterrupt:
-        # Expected stop path: Ctrl+C. Fall through to finish the session.
+        # Expected stop path: Ctrl+C (or the belt-and-braces path). Fall through.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
         console.print()  # newline after the cleared live display
     else:
         # The daemon died on its own (crash / system sleep). Salvage what we have.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
         console.print("\n[yellow](recorder exited unexpectedly — salvaging partial audio.)[/]")
 
     # Stop the daemon FIRST (no-op if already dead): it drains + closes the WAV
@@ -405,9 +505,78 @@ def _run_live_recording(
     _finish_session_with_status(
         cfg, session_id, model_override=model_override, vad_filter=vad_filter
     )
+    # After a successful transcription, maybe offer to summarise (Step 3). The
+    # prompt only fires at the TRANSCRIBED exit — silent/aborted sessions skip it.
+    _maybe_prompt_summarize(cfg, session_id, summarize_flag=summarize_flag)
 
 
-# ---- stop ------------------------------------------------------------------
+# ---- summarize-on-stop resolution (Step 3) --------------------------------
+
+
+def _maybe_prompt_summarize(
+    cfg: config.RecConfig, session_id: str, *, summarize_flag: str | None
+) -> None:
+    """Offer to summarise after transcription, per the resolution order.
+
+    Fires only when the session reached STATUS_TRANSCRIBED with a transcript on
+    disk. Resolution (see STEP3_SUMMARIES.md §resolution):
+      --summarize + provider  -> summarise, no prompt
+      --summarize + no provider -> error (explicit intent)
+      --no-summarize          -> skip, always
+      auto: always/never/ask  -> as named
+      no provider, no flag    -> no prompt at all
+      non-interactive         -> never prompt; "ask" behaves as "never"
+    """
+    meta = session.load_meta(session_id)
+    if meta is None or meta.status != session.STATUS_TRANSCRIBED:
+        return  # silent / aborted / not-yet-transcribed — nothing to summarise
+    if not session.transcript_path(session_id).exists():
+        return
+
+    summ = dict(cfg.summarize or {})
+    auto = summ.get("auto", "ask")
+    pname = summ.get("provider")
+
+    # Explicit flag wins.
+    if summarize_flag == "no":
+        return
+    if summarize_flag == "yes":
+        if not pname:
+            raise click.ClickException(
+                "--summarize was given but no provider is configured. "
+                "Set summarize.provider in your config and the relevant API-key "
+                "env var, then re-run."
+            )
+        _run_summarize_after_transcription(cfg, session_id)
+        return
+
+    # No flag → governed by auto + provider + interactivity.
+    if not pname:
+        return  # offline by default: no provider, no prompt, no message
+    if auto == "never":
+        return
+    if auto == "always":
+        _run_summarize_after_transcription(cfg, session_id)
+        return
+    # auto == "ask" (default)
+    if not _is_interactive():
+        return  # non-TTY → never prompt; "ask" behaves as "never"
+    timeout_s = float(summ.get("prompt_timeout_s", DEFAULT_PROMPT_TIMEOUT_S))
+    words = meta.word_count or 0
+    click.echo(f"\nTranscript: {session.transcript_path(session_id)} ({words:,} words)")
+    if not prompt_yes_no("Summarise this meeting?", default=True, timeout_s=timeout_s):
+        click.echo(f"(skipped — run `rec summarize {session_id}` later to summarise)")
+        return
+    _run_summarize_after_transcription(cfg, session_id)
+
+
+def _run_summarize_after_transcription(cfg: config.RecConfig, session_id: str) -> None:
+    """Run the summarise pipeline after a transcription, reusing _summarize_command."""
+    _summarize_command(
+        session_id, template_name="default", template_file=None,
+        provider_name=None, tier1_model=None, tier2_model=None, tier3_model=None,
+        dry_run=False, force=True, yes=True, api_key_env=None,
+    )
 
 
 @cli.command()
@@ -421,7 +590,14 @@ def _run_live_recording(
     default=False,
     help="Enable voice-activity-detection pre-filter (default off; see transcriber docs).",
 )
-def stop(model: str | None, vad: bool) -> None:
+@click.option(
+    "--summarize/--no-summarize",
+    "summarize_flag",
+    default=None,
+    help="After transcription, summarise (--summarize) or skip (--no-summarize). "
+         "Without a flag, the summarize.auto config governs (default: ask).",
+)
+def stop(model: str | None, vad: bool, summarize_flag: bool | None) -> None:
     """Stop recording, transcribe, and save the markdown transcript."""
     cfg = config.load_config()
 
@@ -436,6 +612,12 @@ def stop(model: str | None, vad: bool) -> None:
         click.echo("(recorder process had already exited — salvaging partial audio.)")
 
     _finish_session_with_status(cfg, session_id, model_override=model, vad_filter=vad)
+    flag = None
+    if summarize_flag is True:
+        flag = "yes"
+    elif summarize_flag is False:
+        flag = "no"
+    _maybe_prompt_summarize(cfg, session_id, summarize_flag=flag)
 
 
 def _stop_recorder_with_status() -> tuple[bool, int | None]:

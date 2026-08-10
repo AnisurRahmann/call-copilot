@@ -206,7 +206,7 @@ def test_start_default_enters_live_ui_then_finishes(monkeypatch, cfg_written, fa
     # Stub the live UI so the test doesn't actually block — it records that it
     # was called with the right session, then simulates a clean stop.
     live_calls: list = []
-    def fake_live(cfg, sid, *, model_override, vad_filter):
+    def fake_live(cfg, sid, *, model_override, vad_filter, summarize_flag=None):
         live_calls.append((sid, model_override, vad_filter))
     monkeypatch.setattr(cli, "_run_live_recording", fake_live)
 
