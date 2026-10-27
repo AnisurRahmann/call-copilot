@@ -2,6 +2,7 @@
 
 [![call-copilot MCP server](https://glama.ai/mcp/servers/AnisurRahmann/call-copilot/badges/card.svg)](https://glama.ai/mcp/servers/AnisurRahmann/call-copilot)
 [![call-copilot MCP server](https://glama.ai/mcp/servers/AnisurRahmann/call-copilot/badges/score.svg)](https://glama.ai/mcp/servers/AnisurRahmann/call-copilot)
+[![Call Copilot MCP server](https://mcprush.com/badge/call-copilot-mcp/card.svg)](https://mcprush.com/to/call-copilot-mcp?ref=badge)
 
 > One thing. Done really well. Record meetings. Save transcripts. Don't break audio.
 
